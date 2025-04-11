@@ -21,136 +21,9 @@ from utils.nn.tools import (
 )
 from utils.import_tools import import_module
 
-ParticleTransformerTagger_ncoll = import_module(os.path.join(os.path.dirname(__file__), 'ParticleTransformer2024Plus.py'), 'ParT').ParticleTransformerTagger_ncoll
+ParticleTransformerTagger_ncoll = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT').ParticleTransformerTagger_ncoll
 
-
-class ParticleTransformerTaggerForFinetune(nn.Module):
-    def __init__(self, finetune_kw=dict(), **kwargs) -> None:
-        '''
-            finetune_kw (dict): fine-tuning configurations
-            - mode (str): fine-tuning mode, 'cls' for classification, 'reg.guass' for regression with Gaussian NLL loss
-            - input_highlevel_dim (int): dimension of the high-level input features
-            - target_inds: list of target indices for the fine-tuning; can be a list of integers, a single integer, 'all', None
-            - num_ft_nodes (int): number of output nodes of the external FC layer
-            - freeze_main_params (bool): whether to freeze the main model parameters
-            - fc_params (list): list of tuples (dim, dropout) of the FC layers
-            - fc_suff_kw (dict): suffix FC configurations
-                 - append_after (str): 'output', 'hidden', 'fc.0'
-                 - params (list): list of tuples (dim, dropout) of the FC layers
-        '''
-
-        super().__init__()
-        self.for_inference = kwargs.get('for_inference')
-
-        # main model
-        self.main = ParticleTransformerTagger_ncoll(**kwargs)
-
-        # external FC
-        self.mode = finetune_kw.get('mode') # mode of fine-tuning, determine which loss function etc to use
-        self.input_highlevel_dim = finetune_kw.get('input_highlevel_dim')
-        self.target_inds = finetune_kw.get('target_inds')
-        if self.target_inds == 'all':
-            self.target_inds = list(range(kwargs['num_classes']))
-        elif isinstance(self.target_inds, int):
-            self.target_inds = [self.target_inds]
-        self.target_inds_opt = finetune_kw.get('target_inds_opt', None)
-
-        self.num_ft_nodes = finetune_kw.get('num_ft_nodes')
-        self.freeze_main_params = finetune_kw.get('freeze_main_params', True)
-
-        fc_params = finetune_kw.get('fc_params')
-        self.fc_suff_kw = finetune_kw.get('fc_suff_kw', None)
-
-        fcs = []
-        in_dim = kwargs['embed_dims'][-1] + self.input_highlevel_dim # concat high-level input dims to the embed layer
-        for out_dim, drop_rate in fc_params:
-            fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
-            in_dim = out_dim
-        fcs.append(nn.Linear(in_dim, self.num_ft_nodes)) # dim -> num_ft_nodes
-        self.fc = nn.Sequential(*fcs)
-
-        # suffix FC after the main model; appended after output (slicing by target_inds) or the last hidden layer
-        if self.fc_suff_kw is not None:
-            fcs = []
-            append_after = self.fc_suff_kw.get('append_after', 'output')
-            if append_after == 'output':
-                in_dim = len(self.target_inds)
-            elif append_after == 'hidden':
-                in_dim = kwargs['embed_dims'][-1]
-            elif append_after == 'fc.0':
-                in_dim = kwargs['fc_params'][0][0]
-            else:
-                raise ValueError('Invalid append_after value')
-            for out_dim, drop_rate in self.fc_suff_kw.get('params'):
-                fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
-                in_dim = out_dim
-            fcs.append(nn.Linear(in_dim, self.num_ft_nodes)) # dim -> num_ft_nodes
-            self.fc_suff = nn.Sequential(*fcs)
-        else:
-            self.fc_suff = None
-
-    def forward(self, *args):
-        if self.freeze_main_params:
-            # freeze the main model
-            # this is important as it also freezes the running stats of the batchnorm layers
-            self.main.eval()
-
-        # process main model
-        if self.input_highlevel_dim > 0:
-            output, x = self.main(*args[:-1])
-            xcat = torch.cat([x, args[-1].squeeze(2)], dim=1)
-        else:
-            output, x = self.main(*args)
-            xcat = x
-        # slicing the output
-        if self.target_inds is not None:
-            output = output[:, self.target_inds]
-            if self.target_inds_opt == 'sum':
-                output = output.sum(dim=1, keepdim=True)
-        else:
-            output = 0
-
-        # process suffix FC (if valid) 
-        # -> modify "output" if new layers (fc_suff) are appended after the main model output / after intermediate hidden/fc.0 layers
-        with torch.autocast('cuda', enabled=self.main.use_amp):
-            if self.fc_suff is not None:
-                append_after = self.fc_suff_kw.get('append_after')
-                if append_after == 'output':
-                    output = self.fc_suff(output)
-                elif append_after == 'hidden':
-                    output = self.fc_suff(x)
-                elif append_after == 'fc.0':
-                    output = self.main.part.fc[0](x)
-                    output = self.fc_suff(output)
-                else:
-                    raise ValueError('Invalid append_after value')
-
-        # process FC
-        with torch.autocast('cuda', enabled=self.main.use_amp):
-            output_fc = self.fc(xcat)
-
-        # use FC nodes as residual to main outputs
-        # note for the special treatment for different fine-tuning modes
-        if self.mode == 'reg.guass':
-            mu, log_var = output_fc.split(1, dim=1)
-            # mu as the residual to the main model output (massCorr + massCorrResid)
-            mu = mu + output
-            output = torch.cat([mu, log_var], dim=1)
-        # elif self.mode == 'reg.guass.fixvar':
-        #     mu = output_fc
-        #     # mu as the residual to the main model output (massCorr + massCorrResid)
-        #     mu = mu + output
-        #     log_var = (torch.zeros_like(mu) + 1).log()
-        #     output = torch.cat([mu, log_var], dim=1)
-        else:
-            # FC output as the residual to the main model output
-            output = output + output_fc
-
-        if self.for_inference:
-            if self.mode == 'cls':
-                output = torch.softmax(output, dim=1)
-        return output
-
+# Adapted from model in example_ParticleTransformer2024PlusTagger_unified2.py
 
 def get_model(data_config, **kwargs):
     assert 'num_nodes' in kwargs, 'num_nodes must be provided'
@@ -164,7 +37,7 @@ def get_model(data_config, **kwargs):
 
     # use SwiGLU-default setup
     cfg = dict(
-        input_dims=tuple(map(lambda x: len(data_config.input_dicts[x]), ['cpf_features', 'npf_features', 'sv_features'])),
+        input_dims=tuple(map(lambda x: len(data_config.input_dicts[x]), ['cpf_features', 'npf_features'])),
         share_embed=False,
         num_classes=num_nodes,
         # network configurations
@@ -204,19 +77,7 @@ def get_model(data_config, **kwargs):
 
     cfg.update(**kwargs)
 
-    if finetune_kw is None:
-        model = ParticleTransformerTagger_ncoll(**cfg)
-    else:
-        # finetune mode
-        assert finetune_kw.get('mode') is not None, 'mode must be provided in finetune_kw'
-        finetune_kw.update(
-            input_highlevel_dim=len(data_config.input_dicts.get('jet_features', [])),
-        )
-        cfg.update(
-            finetune_kw=finetune_kw,
-            return_embed=True, # return the last embed layer before FC
-        )
-        model = ParticleTransformerTaggerForFinetune(**cfg)
+    model = ParticleTransformerTagger_ncoll(**cfg)
 
     # set special args
     model.num_nodes = num_nodes

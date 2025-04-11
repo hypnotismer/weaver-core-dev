@@ -257,16 +257,20 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
     # customized evaluation: making ROC curves for tensorboard monitoring
     if tb_helper:
         scores_dict = {
-            'Xbb': scores[:, 0],
-            'Xcc': scores[:, 1],
-            'QCD': np.sum(scores[:, 161:188], axis=1), # sum of the last 27 scores to form the QCD score
+            'B': scores[:, 0] + scores[:, 1] + scores[:, 17],
+            'C': scores[:, 2] + scores[:, 3] + scores[:, 18],
+            'S': scores[:, 4] + scores[:, 5] + scores[:, 19],
+            'G': scores[:, 10] + scores[:, 22],
+            'L': scores[:, 6] + scores[:, 7] + scores[:, 8] + scores[:, 9] + scores[:, 20] + scores[:, 21]
         }
         flag_dict = {
-            'Xbb': labels['truth_label'] == 0,
-            'Xcc': labels['truth_label'] == 1,
-            'QCD': (labels['truth_label'] >= 161) & (labels['truth_label'] < 188),
+            'B': (labels['truth_label'] == 0) | (labels['truth_label'] == 1) | (labels['truth_label'] == 17),
+            'C': (labels['truth_label'] == 2) | (labels['truth_label'] == 3) | (labels['truth_label'] == 18),
+            'S': (labels['truth_label'] == 4) | (labels['truth_label'] == 5) | (labels['truth_label'] == 19),
+            'G': (labels['truth_label'] == 10) | (labels['truth_label'] == 22),
+            'L': (labels['truth_label'] == 6) | (labels['truth_label'] == 7) | (labels['truth_label'] == 8) | (labels['truth_label'] == 9) | (labels['truth_label'] == 20) | (labels['truth_label'] == 21),
         }
-        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
+        comp_list = [('B', 'L'), ('C', 'L'), ('S', 'L'), ('G', 'L')] # ROC curves for A vs B
         bkgrej = {}
 
         f, ax = plt.subplots(figsize=(5, 5))

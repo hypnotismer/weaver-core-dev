@@ -128,6 +128,7 @@ class DataConfig(object):
                 self.var_funcs[self.weight_name] = '*'.join(opts['weights']['weight_branches'])
             else:
                 self.reweight_method = opts['weights']['reweight_method']
+                self.reweight_hist_ref = opts['weights'].get('reweight_hist_ref', None)
                 self.reweight_basewgt = opts['weights'].get('reweight_basewgt', None)
                 if self.reweight_basewgt:
                     self.var_funcs[self.basewgt_name] = self.reweight_basewgt

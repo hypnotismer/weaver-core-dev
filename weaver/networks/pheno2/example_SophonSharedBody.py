@@ -1,6 +1,9 @@
 import numpy as np
 import awkward as ak
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
 import tqdm
 import time
 import os
@@ -21,42 +24,74 @@ from utils.import_tools import import_module
 ParticleTransformer = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT').ParticleTransformer
 
 '''
-This code is adapted from Sophon's official repository: https://github.com/jet-universe/sophon/blob/main/networks/example_ParticleTransformer_sophon.py
+This code is modified from example_Sophon.py
+ - add freeze_mode
+ - define FC layer outside of the main ParT body
+ - allow custom merge_after_nth_layer
 '''
 
-class ParticleTransformerSophonWrapper(torch.nn.Module):
+def apply_sequential(module_list, x):
+    for m in module_list:
+        x = m(x)
+    return x
+
+def ffn_layers(input_dim=None, output_dim=None, fc_params=[], bias_last=True):
+    layers = nn.ModuleList()
+    in_dim = input_dim
+    for out_dim, drop_rate in fc_params:
+        layers.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
+        in_dim = out_dim
+    layers.append(nn.Linear(in_dim, output_dim, bias=bias_last))
+    return layers
+
+
+class ParticleTransformerSophonSharedBodyWrapper(torch.nn.Module):
     def __init__(self, **kwargs) -> None:
         super().__init__()
         self.export_embed = kwargs.pop('export_embed', False)
+        self.merge_after_nth_layer = kwargs.pop('merge_after_nth_layer', -1)
+        self.freeze_mode = kwargs.pop('freeze_mode', False)
+
+        fc_params = kwargs.get('fc_params', None)
+        kwargs['fc_params'] = None
         self.mod = ParticleTransformer(**kwargs)
+        self.fc_layers = ffn_layers(input_dim=kwargs['embed_dims'][-1], output_dim=kwargs['num_classes'], fc_params=fc_params, bias_last=True)
 
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'mod.cls_token', }
 
-    def forward(self, points, features, lorentz_vectors, mask):
+    def forward(self, *args):
         # return self.mod(features, v=lorentz_vectors, mask=mask) # not using the default foward implementation. Should add emport_embed flag
+        assert len(args) % 4 == 0, "Input should be groups of {points, features, vectors, mask}"
+        n = len(args) // 4
 
-        x, padding_mask = self.mod._forward_encoder(features, v=lorentz_vectors, mask=mask)
+        if self.freeze_mode:
+            # force eval mode (parameters all frozen, no batchnorm running stat, no dropout)
+            self.mod.eval()
 
-        with torch.cuda.amp.autocast(enabled=self.mod.use_amp):
-            x_cls = self.mod._forward_aggregator(x, padding_mask)
-            if self.mod.fc is None:
-                return x_cls
-            # fc
-            output = self.mod.fc(x_cls)
-            if self.mod.for_inference:
-                output = torch.softmax(output, dim=1)
-            if self.export_embed:
-                return torch.cat([output, x_cls], dim=1)
-            else:
-                return output
+        # mod should return x_cls since fc_params is set to None
+        x_cls = []
+        for i in range(n):
+            points, features, lorentz_vectors, mask = args[i*4:(i+1)*4]
+            x_cls.append(self.mod(features, v=lorentz_vectors, mask=mask))
+
+        x = torch.stack(x_cls, dim=1) # (bsz, n, hidden_dim)
+
+        x = apply_sequential(self.fc_layers[:(self.merge_after_nth_layer+1)], x)
+        x = x.mean(dim=1) # (bsz, hidden_dim)
+        output = apply_sequential(self.fc_layers[(self.merge_after_nth_layer+1):], x)
+
+        if self.mod.for_inference:
+            output = torch.softmax(output, dim=1)
+
+        return output
 
 
 def get_model(data_config, **kwargs):
 
     cfg = dict(
-        input_dim=len(data_config.input_dicts['pf_features']),
+        input_dim=[len(v) for k, v in data_config.input_dicts.items() if k.endswith('pf_features')][0],
         num_classes=None,
         # network configurations
         pair_input_dim=4,
@@ -77,7 +112,7 @@ def get_model(data_config, **kwargs):
     cfg.update(**kwargs)
     _logger.info('Model config: %s' % str(cfg))
 
-    model = ParticleTransformerSophonWrapper(**cfg)
+    model = ParticleTransformerSophonSharedBodyWrapper(**cfg)
 
     model_info = {
         'input_names': list(data_config.input_names),
@@ -257,16 +292,16 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
     # customized evaluation: making ROC curves for tensorboard monitoring
     if tb_helper:
         scores_dict = {
-            'Xbb': scores[:, 0],
-            'Xcc': scores[:, 1],
-            'QCD': np.sum(scores[:, 161:188], axis=1), # sum of the last 27 scores to form the QCD score
+            'cls_0': scores[:, 0],
+            'cls_1': scores[:, 1],
+            'cls_2': scores[:, 2],
         }
         flag_dict = {
-            'Xbb': labels['truth_label'] == 0,
-            'Xcc': labels['truth_label'] == 1,
-            'QCD': (labels['truth_label'] >= 161) & (labels['truth_label'] < 188),
+            'cls_0': labels['truth_label'] == 0,
+            'cls_1': labels['truth_label'] == 1,
+            'cls_2': labels['truth_label'] == 2,
         }
-        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
+        comp_list = [('cls_1', 'cls_0'), ('cls_2', 'cls_0')] # ROC curves for A vs B
         bkgrej = {}
 
         f, ax = plt.subplots(figsize=(5, 5))

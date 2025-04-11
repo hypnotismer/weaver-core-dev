@@ -1,0 +1,72 @@
+selection:
+   ### use `&`, `|`, `~` for logical operations on numpy arrays
+   ### can use functions from `math`, `np` (numpy), and `awkward` in the expression
+   (is_t_matched | is_w_matched | is_tbq_matched | is_tbc_matched | is_non_matched | is_wjets) & 
+   ((is_sample_tbh & is_w_matched) | (~is_sample_tbh & ~is_w_matched))
+
+test_time_selection:
+   (fjcand_sdmass > -1)
+
+new_variables:
+   ### [format] name: formula
+   ### can use functions from `math`, `np` (numpy), and `awkward` in the expression
+
+   # define labels
+   is_tbQ_matched: is_tbc_matched | is_tbq_matched
+
+preprocess:
+  ### method: [manual, auto] - whether to use manually specified parameters for variable standardization
+  method: manual
+  ### data_fraction: fraction of events to use when calculating the mean/scale for the standardization
+  data_fraction: 0.5
+
+inputs:
+   pf_points:
+      length: 8
+      pad_mode: wrap
+      ### [format 1]: var_name (no transformation)
+      ### [format 2]: [var_name, 
+      ###              subtract_by(optional, default=None, no transf. if preprocess.method=manual, auto transf. if preprocess.method=auto), 
+      ###              multiply_by(optional, default=1), 
+      ###              clip_min(optional, default=-5), 
+      ###              clip_max(optional, default=5), 
+      ###              pad_value(optional, default=0)]
+      vars: 
+         - [obj_pt, null] # this is dummy inputs
+   pf_features:
+      length: 8
+      pad_mode: wrap
+      vars: 
+         - [obj_pt_log, 4., 1.]
+         - [obj_energy_log, 4., 1.]
+         - [obj_is_fjcand, null]
+         - [obj_is_lep, null]
+         - [obj_is_met, null]
+         - [obj_is_cleanjet, null]
+         - [obj_is_cleanjet_ftag_B1, null]
+         - [obj_is_cleanjet_ftag_B2, null]
+         - [obj_is_cleanjet_ftag_C1, null]
+         - [obj_is_cleanjet_ftag_C2, null]
+         - [obj_is_cleanjet_ftag_N, null]
+   pf_vectors:
+      length: 8
+      pad_mode: wrap
+      vars: 
+         - [obj_px, null]
+         - [obj_py, null]
+         - [obj_pz, null]
+         - [obj_energy, null]
+   pf_mask:
+      length: 8
+      pad_mode: constant
+      vars: 
+         - [obj_mask, null]
+
+labels:
+   ### type can be `simple`, `custom`
+   ### [option 1] use `simple` for binary/multi-class classification, then `value` is a list of 0-1 labels
+   ### [option 2] otherwise use `custom` to define the label, then `value` is a map
+   type: simple
+   value: [is_w_matched, is_t_matched, is_tbQ_matched, is_non_matched, is_wjets]
+
+observers:

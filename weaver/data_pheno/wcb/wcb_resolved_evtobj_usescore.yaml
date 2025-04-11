@@ -1,0 +1,78 @@
+selection:
+   ### use `&`, `|`, `~` for logical operations on numpy arrays
+   ### can use functions from `math`, `np` (numpy), and `awkward` in the expression
+   (ak.values_astype(np.tan(obj_pt[:,0]) * 100000, 'int') % 100 < 50)
+
+test_time_selection:
+   (is_wjets > -1)
+
+new_variables:
+   ### [format] name: formula
+   ### can use functions from `math`, `np` (numpy), and `awkward` in the expression
+
+preprocess:
+  ### method: [manual, auto] - whether to use manually specified parameters for variable standardization
+  method: manual
+  ### data_fraction: fraction of events to use when calculating the mean/scale for the standardization
+  data_fraction: 0.5
+
+inputs:
+   pf_points:
+      length: 8
+      pad_mode: wrap
+      ### [format 1]: var_name (no transformation)
+      ### [format 2]: [var_name, 
+      ###              subtract_by(optional, default=None, no transf. if preprocess.method=manual, auto transf. if preprocess.method=auto), 
+      ###              multiply_by(optional, default=1), 
+      ###              clip_min(optional, default=-5), 
+      ###              clip_max(optional, default=5), 
+      ###              pad_value(optional, default=0)]
+      vars: 
+         - [obj_pt, null] # this is dummy inputs
+   pf_features:
+      length: 8
+      pad_mode: wrap
+      vars: 
+         - [obj_pt_log, 4., 1.]
+         - [obj_energy_log, 4., 1.]
+         - [obj_is_lep, null]
+         - [obj_is_met, null]
+         - [obj_is_cleanjet, null]
+         - [obj_sophon_probB, null]
+         - [obj_sophon_probC, null]
+   pf_vectors:
+      length: 8
+      pad_mode: wrap
+      vars: 
+         - [obj_px, null]
+         - [obj_py, null]
+         - [obj_pz, null]
+         - [obj_energy, null]
+   pf_mask:
+      length: 8
+      pad_mode: constant
+      vars: 
+         - [obj_mask, null]
+
+labels:
+   ### type can be `simple`, `custom`
+   ### [option 1] use `simple` for binary/multi-class classification, then `value` is a list of 0-1 labels
+   ### [option 2] otherwise use `custom` to define the label, then `value` is a map
+   type: simple
+   value: [is_ttbarsl, is_wjets, is_wwsl, is_twsl, is_ttbarsl_wcb, is_twsl_wcb, is_wwsl_wcb]
+
+observers:
+
+# weights:
+#    ### [option 1] use precomputed weights stored in the input files
+#    # use_precomputed_weights: true
+#    # weight_branches: [weight, class_weight]
+#    ### [option 2] compute weights on-the-fly using reweighting histograms
+#    use_precomputed_weights: false
+#    reweight_method: flat
+#    reweight_vars:
+#       fjcand_sdmass: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250]
+#       is_wjets: [-10, 10]
+#    reweight_classes: [is_w_matched, is_tbQ_matched, is_non_matched, is_wjets]
+#    class_weights: [1., 1., 1., 2.]
+#    reweight_hists:

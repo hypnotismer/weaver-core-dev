@@ -579,7 +579,7 @@ def optim(args, model, device):
                 anneal_strategy='cos', div_factor=25.0, last_epoch=-1 if args.load_epoch is None else args.load_epoch)
             scheduler._update_per_step = True  # mark it to update the lr every step, instead of every epoch
         elif args.lr_scheduler == 'cosanneal':
-            base_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, 4, 2, verbose=False)
+            base_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, 4, 2, verbose=False, last_epoch=-1 if args.load_epoch is None else args.load_epoch)
             from utils.nn.scheduler.warmup import GradualWarmupScheduler
             scheduler = GradualWarmupScheduler(opt, multiplier=1,
                                                 warmup_epoch=5,
@@ -718,6 +718,14 @@ def model_setup(args, data_config):
             if args.load_model_weights == 'finetune_stage3beta4p1':
                 model_state = torch.load("./model/ak8_MD_inclv10beta4_ul_manual.nlayer10.vispart_as_resid.ddp4-bs640-lr1p2e-3.nepoch100.farm221/net_best_epoch_state.pt", map_location='cpu')
                 model_state = {f'main.{k}': v for k, v in model_state.items()}
+                missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+                assert len(unexpected_keys) == 0
+                _logger.info('Model initialized with weights from GloParT v3beta4p1\n ... Missing: %s\n ... Unexpected: %s' %
+                        (missing_keys, unexpected_keys))
+            if args.load_model_weights == 'finetune_stage3beta4p1_scoutpretrain.tillfc0':
+                model_state = torch.load("./model/ak8_MD_inclv10beta4_ul_manual.nlayer10.vispart_as_resid.ddp4-bs640-lr1p2e-3.nepoch100.scoutpretrain/net_best_epoch_state.pt", map_location='cpu')
+                # get model params except for the last fc.1 layer
+                model_state = {k: v for k, v in model_state.items() if not k.startswith('part.fc.1')}
                 missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
                 assert len(unexpected_keys) == 0
                 _logger.info('Model initialized with weights from GloParT v3beta4p1\n ... Missing: %s\n ... Unexpected: %s' %

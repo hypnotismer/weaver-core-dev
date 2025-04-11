@@ -235,8 +235,14 @@ class WeightMaker(object):
                 # divide by classwgt here will effective increase the weight later
                 class_events[label] = np.sum(raw_hists[label] * wgt) / classwgt
         elif self._data_config.reweight_method == 'ref':
-            # use class 0 as the reference
-            hist_ref = raw_hists[self._data_config.reweight_classes[0]]
+            if self._data_config.reweight_hist_ref is not None:
+                hist_ref = np.array(self._data_config.reweight_hist_ref, dtype='float32')
+                assert hist_ref.shape == raw_hists[self._data_config.reweight_classes[0]].shape, \
+                    'Error: shape of reference histogram does not match the shape of the reweighting histograms!'
+            else:
+                # use class 0 as the reference
+                hist_ref = raw_hists[self._data_config.reweight_classes[0]]
+            _logger.info('Using reweight method "ref". hist_ref:\n%s', str(hist_ref))
             for label, classwgt in zip(self._data_config.reweight_classes, self._data_config.class_weights):
                 # wgt: bins w/ 0 elements will get a weight of 0; bins w/ content<ref_val will get 1
                 ratio = np.nan_to_num(hist_ref / result[label], posinf=0)

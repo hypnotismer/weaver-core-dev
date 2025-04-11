@@ -1,0 +1,325 @@
+### use `&`, `|`, `~` for logical operations on numpy arrays
+### can use functions from `math`, `np` (numpy), and `ak` in the expression
+
+# to select scouting jets, ensure that QCD scouting jets from the resonant (signal) samples are not included (they are not excluded in the samples; only reco QCD jets are excluded)
+selection: >-
+    (jet_tightId==1) & (jet_no<2) & (scoutfj_pt>200) & (scoutfj_pt<5000) & (scoutfj_sdmass>0) & (scoutfj_sdmass<650) & (ak.num(scoutpfcand_px) > 0) &
+    (
+      ((sample_isQCD==1) & (scoutfj_label >= 309) & (scoutfj_label < 314) & (event_no%7!=0)) |
+      ((sample_isQCD==0) & (scoutfj_isQCD==0))
+    )
+### selection to apply at test time (i.e., when running w/ --predict)
+test_time_selection: >-
+    (jet_tightId==1) & (jet_no<2)
+
+new_variables:
+    ### [format] name: formula
+    ### can use functions from `math`, `np` (numpy), and `ak` in the expression
+    # classes for reweighting
+    label_Top_bWQQ: ((scoutfj_label >= 0) & (scoutfj_label < 2))
+    label_Top_bWQ: ((scoutfj_label >= 2) & (scoutfj_label < 5))
+    label_Top_bWev: (scoutfj_label == 5)
+    label_Top_bWmv: (scoutfj_label == 6)
+    label_Top_bWtauev: (scoutfj_label == 7)
+    label_Top_bWtaumv: (scoutfj_label == 8)
+    label_Top_bWtauhv: (scoutfj_label == 9)
+    label_Top_WQQ: ((scoutfj_label >= 10) & (scoutfj_label < 12))
+    label_Top_Wev: (scoutfj_label == 12)
+    label_Top_Wmv: (scoutfj_label == 13)
+    label_Top_Wtauev: (scoutfj_label == 14)
+    label_Top_Wtaumv: (scoutfj_label == 15)
+    label_Top_Wtauhv: (scoutfj_label == 16)
+    label_H_bb: (scoutfj_label == 17)
+    label_H_cc: (scoutfj_label == 18)
+    label_H_ss: (scoutfj_label == 19)
+    label_H_qq: (scoutfj_label == 20) & (scoutfj_gen_pid == 25)
+    label_H_bc: (scoutfj_label == 21)
+    label_H_bs: (scoutfj_label == 22)
+    label_H_cs: (scoutfj_label == 23)
+    label_H_ud: (scoutfj_label == 20) & (np.abs(scoutfj_gen_pid) == 37)
+    label_H_gg: (scoutfj_label == 24)
+    label_H_ee: (scoutfj_label == 25)
+    label_H_mm: (scoutfj_label == 26)
+    label_H_tauhtaue: (scoutfj_label == 27)
+    label_H_tauhtaum: (scoutfj_label == 28)
+    label_H_tauhtauh: (scoutfj_label == 29)
+    label_QCD: (fj_label >= 309) & (fj_label < 314)
+
+    # define "v3 for scouting" labels
+    # in the order of actually label for training
+    #  - 0--3:      H_bb, cc, ss, qq, fj_label=17--20
+    #  - 4--5:      H_bc, Hplus/minus, fj_label=21
+    #  - 6:         H_bs, fj_label=22
+    #  - 7--8:      H_cs, Hplus/minus, fj_label=23
+    #  - 9-10:      H_ud, Hplus/minus, fj_label=20
+    #  - 11:        H_gg, fj_label=24 (*in v3*: 9)
+    #  - 12--16:    H_ee, mm, tauhtaue, tauhtaum, tauhtauh, fj_label=25--29 (*in v3*: 11-15)
+    #  - 17--21:    QCD, fj_label=309--313 (*in v3*: 369--373)
+    fj_label_scout: >-
+        ak.where((scoutfj_label >= 17) & (scoutfj_label <= 20) & (scoutfj_gen_pid == 25), scoutfj_label - 17,
+        ak.where((scoutfj_label == 21) & (scoutfj_gen_pid > 0), 4,
+        ak.where((scoutfj_label == 21) & (scoutfj_gen_pid < 0), 5,
+        ak.where((scoutfj_label == 22), 6,
+        ak.where((scoutfj_label == 23) & (scoutfj_gen_pid > 0), 7,
+        ak.where((scoutfj_label == 23) & (scoutfj_gen_pid < 0), 8,
+        ak.where((scoutfj_label == 20) & (scoutfj_gen_pid == 37), 9,
+        ak.where((scoutfj_label == 20) & (scoutfj_gen_pid == -37), 10,
+        ak.where((scoutfj_label == 24), 11,
+        ak.where((scoutfj_label >= 25) & (scoutfj_label <= 29), scoutfj_label - 13,
+        ak.where((scoutfj_label >= 309) & (scoutfj_label <= 313), scoutfj_label - 352, 10000)))))))))))
+
+    # charged and neutral scoutingpfcand
+    is_charged: scoutpfcand_charge != 0
+    cscoutpfcand_pt_log: scoutpfcand_pt_log[is_charged]
+    cscoutpfcand_e_log: scoutpfcand_e_log[is_charged]
+    cscoutpfcand_etarel: scoutpfcand_etarel[is_charged]
+    cscoutpfcand_phirel: scoutpfcand_phirel[is_charged]
+    cscoutpfcand_abseta: scoutpfcand_abseta[is_charged]
+    cscoutpfcand_charge: scoutpfcand_charge[is_charged]
+    cscoutpfcand_isEl: scoutpfcand_isEl[is_charged]
+    cscoutpfcand_isMu: scoutpfcand_isMu[is_charged]
+    cscoutpfcand_isChargedHad: scoutpfcand_isChargedHad[is_charged]
+    cscoutpfcand_lostInnerHits: scoutpfcand_lostInnerHits[is_charged]
+    cscoutpfcand_normchi2: scoutpfcand_normchi2[is_charged]
+    cscoutpfcand_quality: scoutpfcand_quality[is_charged]
+    cscoutpfcand_dz: scoutpfcand_dz[is_charged]
+    cscoutpfcand_dzsig: scoutpfcand_dzsig[is_charged]
+    cscoutpfcand_dxy: scoutpfcand_dxy[is_charged]
+    cscoutpfcand_dxysig: scoutpfcand_dxysig[is_charged]
+    cscoutpfcand_btagEtaRel: scoutpfcand_btagEtaRel[is_charged]
+    cscoutpfcand_btagPtRatio: scoutpfcand_btagPtRatio[is_charged]
+    cscoutpfcand_btagPParRatio: scoutpfcand_btagPParRatio[is_charged]
+    cscoutpfcand_px: scoutpfcand_px[is_charged]
+    cscoutpfcand_py: scoutpfcand_py[is_charged]
+    cscoutpfcand_pz: scoutpfcand_pz[is_charged]
+    cscoutpfcand_energy: scoutpfcand_energy[is_charged]
+
+    nscoutpfcand_pt_log: scoutpfcand_pt_log[~is_charged]
+    nscoutpfcand_e_log: scoutpfcand_e_log[~is_charged]
+    nscoutpfcand_etarel: scoutpfcand_etarel[~is_charged]
+    nscoutpfcand_phirel: scoutpfcand_phirel[~is_charged]
+    nscoutpfcand_abseta: scoutpfcand_abseta[~is_charged]
+    nscoutpfcand_isGamma: scoutpfcand_isGamma[~is_charged]
+    nscoutpfcand_isNeutralHad: scoutpfcand_isNeutralHad[~is_charged]
+    nscoutpfcand_px: scoutpfcand_px[~is_charged]
+    nscoutpfcand_py: scoutpfcand_py[~is_charged]
+    nscoutpfcand_pz: scoutpfcand_pz[~is_charged]
+    nscoutpfcand_energy: scoutpfcand_energy[~is_charged]
+
+    # masks
+    cscoutpfcand_mask: ak.ones_like(cscoutpfcand_px)
+    nscoutpfcand_mask: ak.ones_like(nscoutpfcand_px)
+
+preprocess:
+    ### method: [manual, auto] - whether to use manually specified parameters for variable standardization
+    method: manual
+    ### data_fraction: fraction of events to use when calculating the mean/scale for the standardization
+    data_fraction:
+
+inputs:
+    cpf_features:
+        length: 90
+        pad_mode: wrap
+        vars:
+            ### [format 1]: var_name (no transformation)
+            ### [format 2]: [var_name,
+            ###              subtract_by(optional, default=None, no transf. if preprocess.method=manual, auto transf. if preprocess.method=auto),
+            ###              multiply_by(optional, default=1),
+            ###              clip_min(optional, default=-5),
+            ###              clip_max(optional, default=5),
+            ###              pad_value(optional, default=0)]
+            - [cscoutpfcand_pt_log_nopuppi, 1, 0.5]
+            - [cscoutpfcand_e_log_nopuppi, 1.3, 0.5]
+            - cscoutpfcand_etarel
+            - cscoutpfcand_phirel
+            - [cscoutpfcand_abseta, 0.6, 1.6]
+            - cscoutpfcand_charge
+            - cscoutpfcand_isEl
+            - cscoutpfcand_isMu
+            - cscoutpfcand_isChargedHad
+            - cscoutpfcand_lostInnerHits
+            - [cscoutpfcand_normchi2, 5, 0.2]
+            - [cscoutpfcand_quality, 0, 0.2]
+            - [cscoutpfcand_dz, 0, 180]
+            - [cscoutpfcand_dzsig, 0, 0.9]
+            - [cscoutpfcand_dxy, 0.0, 300]
+            - [cscoutpfcand_dxysig, 0, 1.0]
+            - [cscoutpfcand_btagEtaRel, 1.5, 0.5]
+            - [cscoutpfcand_btagPtRatio, 0, 1]
+            - [cscoutpfcand_btagPParRatio, 0, 1]
+    cpf_vectors:
+        length: 90
+        pad_mode: wrap
+        vars:
+            - [cscoutpfcand_px, null]
+            - [cscoutpfcand_py, null]
+            - [cscoutpfcand_pz, null]
+            - [cscoutpfcand_energy, null]
+    cpf_mask:
+        length: 90
+        pad_mode: constant
+        vars:
+            - cscoutpfcand_mask
+    npf_features:
+        length: 60
+        pad_mode: wrap
+        vars:
+            - [nscoutpfcand_pt_log_nopuppi, 1, 0.5]
+            - [nscoutpfcand_e_log_nopuppi, 1.3, 0.5]
+            - nscoutpfcand_etarel
+            - nscoutpfcand_phirel
+            - [nscoutpfcand_abseta, 0.6, 1.6]
+            - nscoutpfcand_isGamma
+            - nscoutpfcand_isNeutralHad
+    npf_vectors:
+        length: 60
+        pad_mode: wrap
+        vars:
+            - [nscoutpfcand_px, null]
+            - [nscoutpfcand_py, null]
+            - [nscoutpfcand_pz, null]
+            - [nscoutpfcand_energy, null]
+    npf_mask:
+        length: 60
+        pad_mode: constant
+        vars:
+            - nscoutpfcand_mask
+
+labels:
+    ### type can be `simple`, `custom`, 'hybrid'
+    type: custom
+    value:
+      truth_label: fj_label_scout  # just input the label index
+      target_res_mass_factor: np.where(scoutfj_isQCD, fj_genjet_sdmass, scoutfj_gen_mass) / np.maximum(scoutfj_mass, 1e-6)
+      target_parts_mass_factor: np.where(scoutfj_isQCD, fj_genjet_nomu_sdmass, scoutfj_genparts_mass) / np.maximum(scoutfj_mass, 1e-6)
+
+observers:
+    - event_no
+    - fj_label
+    - fj_label_mod
+    - fj_pt
+    - fj_eta
+    - fj_phi
+    - fj_mass
+    - fj_sdmass
+    - fj_sdmass_fromsubjets
+    - fj_gen_mass
+    - fj_genparts_mass
+    - fj_genjet_sdmass
+    - fj_genjet_nomu_sdmass
+    - sample_isQCD
+    - pfParticleNetMassRegressionJetTags_mass
+    - pfMassDecorrelatedParticleNetJetTags_probXbb
+    - pfMassDecorrelatedParticleNetJetTags_probXcc
+    - pfMassDecorrelatedParticleNetJetTags_probXqq
+    - pfMassDecorrelatedParticleNetJetTags_probQCDb
+    - pfMassDecorrelatedParticleNetJetTags_probQCDbb
+    - pfMassDecorrelatedParticleNetJetTags_probQCDc
+    - pfMassDecorrelatedParticleNetJetTags_probQCDcc
+    - pfMassDecorrelatedParticleNetJetTags_probQCDothers
+    - pfParticleNetJetTags_probHbb
+    - pfParticleNetJetTags_probHcc
+    - pfParticleNetJetTags_probHqqqq
+    - pfParticleNetJetTags_probQCDb
+    - pfParticleNetJetTags_probQCDbb
+    - pfParticleNetJetTags_probQCDc
+    - pfParticleNetJetTags_probQCDcc
+    - pfParticleNetJetTags_probQCDothers
+    - pfParticleNetJetTags_probTbc
+    - pfParticleNetJetTags_probTbcq
+    - pfParticleNetJetTags_probTbel
+    - pfParticleNetJetTags_probTbmu
+    - pfParticleNetJetTags_probTbq
+    - pfParticleNetJetTags_probTbqq
+    - pfParticleNetJetTags_probTbta
+    - pfParticleNetJetTags_probWcq
+    - pfParticleNetJetTags_probWqq
+    - pfParticleNetJetTags_probZbb
+    - pfParticleNetJetTags_probZcc
+    - pfParticleNetJetTags_probZqq
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HbbvsQCD
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HccvsQCD
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HggvsQCD
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HqqvsQCD
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HtevsQCD
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HtmvsQCD
+    - pfParticleNetFromMiniAODAK8DiscriminatorsJetTags_HttvsQCD
+    - pfParticleNetFromMiniAODAK8JetTags_masscorr
+    - pfParticleNetFromMiniAODAK8JetTags_probHbb
+    - pfParticleNetFromMiniAODAK8JetTags_probHcc
+    - pfParticleNetFromMiniAODAK8JetTags_probHgg
+    - pfParticleNetFromMiniAODAK8JetTags_probHqq
+    - pfParticleNetFromMiniAODAK8JetTags_probHte
+    - pfParticleNetFromMiniAODAK8JetTags_probHtm
+    - pfParticleNetFromMiniAODAK8JetTags_probHtt
+    - pfParticleNetFromMiniAODAK8JetTags_probQCD0hf
+    - pfParticleNetFromMiniAODAK8JetTags_probQCD1hf
+    - pfParticleNetFromMiniAODAK8JetTags_probQCD2hf
+    - pfGlobalParticleTransformerAK8JetTags_probXbb
+    - pfGlobalParticleTransformerAK8JetTags_probXcc
+    - pfGlobalParticleTransformerAK8JetTags_probXcs
+    - pfGlobalParticleTransformerAK8JetTags_probXqq
+    - pfGlobalParticleTransformerAK8JetTags_probXWW4q
+    - pfGlobalParticleTransformerAK8JetTags_probXWW3q
+    - pfGlobalParticleTransformerAK8JetTags_probXWWqqev
+    - pfGlobalParticleTransformerAK8JetTags_probXWWqqmv
+    - pfGlobalParticleTransformerAK8JetTags_probXtauhtaue
+    - pfGlobalParticleTransformerAK8JetTags_probXtauhtaum
+    - pfGlobalParticleTransformerAK8JetTags_probXtauhtauh
+    - pfGlobalParticleTransformerAK8JetTags_probTopbWqq
+    - pfGlobalParticleTransformerAK8JetTags_probTopbWq
+    - pfGlobalParticleTransformerAK8JetTags_probTopbWev
+    - pfGlobalParticleTransformerAK8JetTags_probTopbWmv
+    - pfGlobalParticleTransformerAK8JetTags_probTopbWtauhv
+    - pfGlobalParticleTransformerAK8JetTags_probWithMassTopvsQCD
+    - pfGlobalParticleTransformerAK8JetTags_probWithMassWvsQCD
+    - pfGlobalParticleTransformerAK8JetTags_probWithMassZvsQCD
+    - pfGlobalParticleTransformerAK8JetTags_probQCD
+    - pfGlobalParticleTransformerAK8JetTags_massCorrGeneric
+    - pfGlobalParticleTransformerAK8JetTags_massCorrX2p
+    # scouting jet features
+    - scoutfj_label
+    - scoutfj_pt
+    - scoutfj_eta
+    - scoutfj_phi
+    - scoutfj_energy
+    - scoutfj_mass
+    - scoutfj_sdmass
+    - scoutfj_gen_pt
+    - scoutfj_gen_eta
+    - scoutfj_gen_phi
+    - scoutfj_gen_mass
+    - scoutfj_gen_pid
+    - scoutfj_gen_deltaR
+    - scoutfj_genpart1_pid
+    - scoutfj_genpart2_pid
+    - scoutfj_probHbb
+    - scoutfj_probHcc
+    - scoutfj_probHqq
+    - scoutfj_probQCD
+    - scoutfj_massreg
+
+weights:
+    ### [option 1] use precomputed weights stored in the input files
+    # use_precomputed_weights: true
+    # weight_branches: [weight, class_weight]
+    ### [option 2] compute weights on-the-fly using reweighting histograms
+    use_precomputed_weights: false
+    reweight_method: flat
+    reweight_vars:
+        scoutfj_pt: [200, 251, 316, 398, 501, 631, 794, 1000, 1258, 1583, 1993, 2508, 3156, 3972, 5000]
+        scoutfj_sdmass: [0, 7.1, 14.5, 22.1, 29.9, 38.0, 46.3, 54.9, 63.7, 72.7, 82.0, 91.5, 101.3, 111.3, 121.5, 132.0, 142.7, 153.7, 164.9, 176.3, 188.0, 199.9, 212.1, 224.5, 237.1, 250.0, 263.1, 276.5, 290.1, 303.9, 318.0, 332.3, 346.9, 361.7, 376.7, 392.0, 407.5, 423.3, 439.3, 455.5, 472.0, 488.7, 505.7, 522.9, 540.3, 558.0, 575.9, 594.1, 612.5, 631.1, 650.0]
+    reweight_classes:
+        [
+          label_H_bb, label_H_cc, label_H_ss, label_H_qq, label_H_bc, label_H_bs, label_H_cs, label_H_ud, label_H_gg,
+          label_H_ee, label_H_mm, label_H_tauhtaue, label_H_tauhtaum, label_H_tauhtauh, 
+          label_QCD, 
+        ]
+    class_weights:
+      [
+        0.16, 0.16, 0.16, 0.16, 0.16, 0.16, 0.16, 0.16, 0.16, 
+        0.06, 0.06, 0.04, 0.04, 0.12,
+        1,
+      ]
+    reweight_hists:
+
