@@ -28,6 +28,7 @@ This code is modified from example_Sophon.py
  - add freeze_mode
  - define FC layer outside of the main ParT body
  - allow custom merge_after_nth_layer
+ - new eval/test utilities: custom BkgRej maker; custom label_cls_nodes and label_stored for saving outpout nodes
 '''
 
 def apply_sequential(module_list, x):
@@ -112,7 +113,15 @@ def get_model(data_config, **kwargs):
     cfg.update(**kwargs)
     _logger.info('Model config: %s' % str(cfg))
 
+    # remove the eval/test-time related options from cfg
+    eval_kw = cfg.pop('eval_kw', dict())
+    cfg.pop('label_cls_nodes', None)
+    cfg.pop('label_stored', None)
+
     model = ParticleTransformerSophonSharedBodyWrapper(**cfg)
+    
+    # set eval_kw for ROC curve configuration
+    model.eval_kw = eval_kw
 
     model_info = {
         'input_names': list(data_config.input_names),
@@ -134,6 +143,10 @@ def get_train_fn(data_config, **kwargs):
 
 def get_evaluate_fn(data_config, **kwargs):
     return evaluate_classification_sophon
+
+
+def get_save_fn(data_config, **kwargs):
+    return save_classification_sophon
 
 
 # Customized training and evaluation functions for Sophon
@@ -237,6 +250,8 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
     labels_counts = []
     observers = defaultdict(list)
     start_time = time.time()
+    eval_kw = model.module.eval_kw \
+        if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.eval_kw
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, y, Z in tq:
@@ -252,7 +267,7 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
                     labels[k].append(v.numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
-                        observers[k].append(v)
+                        observers[k].append(v.numpy(force=True))
 
                 num_examples = label.shape[0]
                 label_counter.update(label.numpy(force=True))
@@ -290,18 +305,29 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
     labels = {k: _concat(v) for k, v in labels.items()}
 
     # customized evaluation: making ROC curves for tensorboard monitoring
-    if tb_helper:
-        scores_dict = {
-            'cls_0': scores[:, 0],
-            'cls_1': scores[:, 1],
-            'cls_2': scores[:, 2],
+    if tb_helper and for_training:
+        truth_label = labels['truth_label']
+        scores_dict, flag_dict = {}, {}
+        
+        # Default ROC curve configuration for cls_0, cls_1, cls_2
+        roc_kwargs_default = {
+            'label_inds_map': {
+                'cls_0': [0],
+                'cls_1': [1], 
+                'cls_2': [2],
+            },
+            'comp_list': [('cls_1', 'cls_0'), ('cls_2', 'cls_0')] # ROC curves for A vs B
         }
-        flag_dict = {
-            'cls_0': labels['truth_label'] == 0,
-            'cls_1': labels['truth_label'] == 1,
-            'cls_2': labels['truth_label'] == 2,
-        }
-        comp_list = [('cls_1', 'cls_0'), ('cls_2', 'cls_0')] # ROC curves for A vs B
+        
+        # Use provided roc_kw or fall back to default
+        roc_kwargs = eval_kw.get('roc_kw', roc_kwargs_default)
+        
+        for name, inds in roc_kwargs.get('label_inds_map').items():
+            flag_dict[name] = np.any([truth_label == i for i in inds], axis=0)
+            scores_dict[name] = np.sum(scores[:, inds], axis=1)
+            print(name, flag_dict[name].shape, scores_dict[name].shape)
+        comp_list = roc_kwargs.get('comp_list') # e.g. [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
+        
         bkgrej = {}
 
         f, ax = plt.subplots(figsize=(5, 5))
@@ -347,3 +373,35 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
                     labels[k] = v.reshape((entry_count, -1))
         observers = {k: _concat(v) for k, v in observers.items()}
         return total_correct / count, scores, labels, observers
+
+
+def save_classification_sophon(args, data_config, scores, labels, observers):
+    import ast
+    network_options = {k: ast.literal_eval(v) for k, v in args.network_option}
+
+    num_classes = network_options['num_classes']
+
+    label_default = [f'label_{i}' for i in range(num_classes)]
+    label_cls_nodes = network_options.get('label_cls_nodes', label_default)
+    label_stored = network_options.get('label_stored', label_cls_nodes) # by default, store all classification node scores
+
+    output = {}
+    output['cls_index'] = labels['truth_label'] # classes can be too many, only store the index
+    for idx, label_name in enumerate(label_cls_nodes):
+        if label_name in label_stored:
+            output[label_name] = (labels['truth_label'] == idx)
+            output['score_' + label_name] = scores[:, idx]
+
+    for k, v in labels.items():
+        if k == data_config.label_names[0]:
+            continue
+        assert v.ndim == 1
+        output[k] = v
+    for k, v in observers.items():
+        assert v.ndim == 1
+        output[k] = v
+    
+    for k in output.keys():
+        print(k, output[k])
+
+    return output

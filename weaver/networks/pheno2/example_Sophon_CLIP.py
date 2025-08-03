@@ -27,6 +27,7 @@ ParticleTransformer = import_module(os.path.join(os.path.dirname(__file__), '../
 This code is adapted from Sophon's official repository: https://github.com/jet-universe/sophon/blob/main/networks/example_ParticleTransformer_sophon.py
 Additional features:
  - a univeral wrapper for Sophon models for CLIP-only, CLIP+classification and post-CLIP fine-tuning
+ - new eval/test utilities: custom BkgRej maker; custom label_cls_nodes and label_stored for saving outpout nodes
 '''
 
 class FFN(nn.Module):
@@ -299,7 +300,15 @@ def get_model(data_config, **kwargs):
         cfg[k] = v
     _logger.info('Model config: %s' % str(cfg))
 
+    # remove the eval/test-time related options from cfg
+    eval_kw = cfg.pop('eval_kw', dict())
+    cfg.pop('label_cls_nodes', None)
+    cfg.pop('label_stored', None)
+
     model = ParticleTransformerSophonCLIPWrapper(**cfg)
+    
+    # set eval_kw for ROC curve configuration
+    model.eval_kw = eval_kw
 
     model_info = {
         'input_names': list(data_config.input_names),
@@ -322,6 +331,10 @@ def get_train_fn(data_config, **kwargs):
 
 def get_evaluate_fn(data_config, **kwargs):
     return evaluate_classification_sophon_clip
+
+
+def get_save_fn(data_config, **kwargs):
+    return save_classification_sophon_clip
 
 
 # Customized training and evaluation functions for Sophon
@@ -440,6 +453,8 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
     labels_counts = []
     observers = defaultdict(list)
     start_time = time.time()
+    eval_kw = model.module.eval_kw \
+        if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.eval_kw
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, y, Z in tq:
@@ -448,7 +463,10 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
                 label = y[data_config.label_names[0]].long().to(dev)
                 entry_count += label.shape[0]
                 logits, x_mod, x_gen = model(*inputs)
-                loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+                if loss_func is not None:
+                    loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+                else: # for test mode
+                    loss, loss_cls, loss_cont = torch.tensor(0.), torch.tensor(0.), torch.tensor(0.)
 
                 # all-reduce the loss
                 loss = AllGather.apply(loss.unsqueeze(0)).mean().item()
@@ -465,7 +483,7 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
                     labels[k].append(v.numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
-                        observers[k].append(v)
+                        observers[k].append(v.numpy(force=True))
 
                 num_examples = label.shape[0]
                 label_counter.update(label.numpy(force=True))
@@ -517,18 +535,28 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
     labels = {k: _concat(v) for k, v in labels.items()}
 
     # customized evaluation: making ROC curves for tensorboard monitoring
-    if tb_helper and logits is not None:
-        scores_dict = {
-            'Xbb': scores[:, 0],
-            'Xcc': scores[:, 1],
-            'QCD': np.sum(scores[:, 161:188], axis=1), # sum of the last 27 scores to form the QCD score
+    if tb_helper and logits is not None and for_training:
+        truth_label = labels['truth_label']
+        scores_dict, flag_dict = {}, {}
+        
+        # Default ROC curve configuration for cls_0, cls_1, cls_2
+        roc_kwargs_default = {
+            'label_inds_map': {
+                'Xbb': [0],
+                'Xcc': [1], 
+                'QCD': list(range(161, 188)),
+            },
+            'comp_list': [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
         }
-        flag_dict = {
-            'Xbb': labels['truth_label'] == 0,
-            'Xcc': labels['truth_label'] == 1,
-            'QCD': (labels['truth_label'] >= 161) & (labels['truth_label'] < 188),
-        }
-        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
+        
+        # Use provided roc_kw or fall back to default
+        roc_kwargs = eval_kw.get('roc_kw', roc_kwargs_default)
+        
+        for name, inds in roc_kwargs.get('label_inds_map').items():
+            flag_dict[name] = np.any([truth_label == i for i in inds], axis=0)
+            scores_dict[name] = np.sum(scores[:, inds], axis=1)
+            print(name, flag_dict[name].shape, scores_dict[name].shape)
+        comp_list = roc_kwargs.get('comp_list') # e.g. [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
         bkgrej = {}
 
         f, ax = plt.subplots(figsize=(5, 5))
@@ -560,18 +588,52 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
     if for_training:
         return total_correct / count
     else:
-        raise NotImplementedError('Evaluation metrics are not implemented yet')
         # convert 2D labels/scores
-        if len(scores) != entry_count:
-            if len(labels_counts):
-                labels_counts = np.concatenate(labels_counts)
-                scores = ak.unflatten(scores, labels_counts)
-                for k, v in labels.items():
-                    labels[k] = ak.unflatten(v, labels_counts)
-            else:
-                assert (count % entry_count == 0)
-                scores = scores.reshape((entry_count, int(count / entry_count), -1)).transpose((1, 2))
-                for k, v in labels.items():
-                    labels[k] = v.reshape((entry_count, -1))
+        if logits is not None:
+            if len(scores) != entry_count:
+                if len(labels_counts):
+                    labels_counts = np.concatenate(labels_counts)
+                    scores = ak.unflatten(scores, labels_counts)
+                    for k, v in labels.items():
+                        labels[k] = ak.unflatten(v, labels_counts)
+                else:
+                    assert (count % entry_count == 0)
+                    scores = scores.reshape((entry_count, int(count / entry_count), -1)).transpose((1, 2))
+                    for k, v in labels.items():
+                        labels[k] = v.reshape((entry_count, -1))
         observers = {k: _concat(v) for k, v in observers.items()}
         return total_correct / count, scores, labels, observers
+
+
+def save_classification_sophon_clip(args, data_config, scores, labels, observers):
+    import ast
+    network_options = {k: ast.literal_eval(v) for k, v in args.network_option}
+
+    num_classes = network_options['num_classes']
+
+    # default Sophon labels
+    label_sophon_default = ["label_X_bb", "label_X_cc", "label_X_ss", "label_X_qq", "label_X_bc", "label_X_cs", "label_X_bq", "label_X_cq", "label_X_sq", "label_X_gg", "label_X_ee", "label_X_mm", "label_X_tauhtaue", "label_X_tauhtaum", "label_X_tauhtauh", "label_X_YY_bbbb", "label_X_YY_bbcc", "label_X_YY_bbss", "label_X_YY_bbqq", "label_X_YY_bbgg", "label_X_YY_bbee", "label_X_YY_bbmm", "label_X_YY_bbtauhtaue", "label_X_YY_bbtauhtaum", "label_X_YY_bbtauhtauh", "label_X_YY_bbb", "label_X_YY_bbc", "label_X_YY_bbs", "label_X_YY_bbq", "label_X_YY_bbg", "label_X_YY_bbe", "label_X_YY_bbm", "label_X_YY_cccc", "label_X_YY_ccss", "label_X_YY_ccqq", "label_X_YY_ccgg", "label_X_YY_ccee", "label_X_YY_ccmm", "label_X_YY_cctauhtaue", "label_X_YY_cctauhtaum", "label_X_YY_cctauhtauh", "label_X_YY_ccb", "label_X_YY_ccc", "label_X_YY_ccs", "label_X_YY_ccq", "label_X_YY_ccg", "label_X_YY_cce", "label_X_YY_ccm", "label_X_YY_ssss", "label_X_YY_ssqq", "label_X_YY_ssgg", "label_X_YY_ssee", "label_X_YY_ssmm", "label_X_YY_sstauhtaue", "label_X_YY_sstauhtaum", "label_X_YY_sstauhtauh", "label_X_YY_ssb", "label_X_YY_ssc", "label_X_YY_sss", "label_X_YY_ssq", "label_X_YY_ssg", "label_X_YY_sse", "label_X_YY_ssm", "label_X_YY_qqqq", "label_X_YY_qqgg", "label_X_YY_qqee", "label_X_YY_qqmm", "label_X_YY_qqtauhtaue", "label_X_YY_qqtauhtaum", "label_X_YY_qqtauhtauh", "label_X_YY_qqb", "label_X_YY_qqc", "label_X_YY_qqs", "label_X_YY_qqq", "label_X_YY_qqg", "label_X_YY_qqe", "label_X_YY_qqm", "label_X_YY_gggg", "label_X_YY_ggee", "label_X_YY_ggmm", "label_X_YY_ggtauhtaue", "label_X_YY_ggtauhtaum", "label_X_YY_ggtauhtauh", "label_X_YY_ggb", "label_X_YY_ggc", "label_X_YY_ggs", "label_X_YY_ggq", "label_X_YY_ggg", "label_X_YY_gge", "label_X_YY_ggm", "label_X_YY_bee", "label_X_YY_cee", "label_X_YY_see", "label_X_YY_qee", "label_X_YY_gee", "label_X_YY_bmm", "label_X_YY_cmm", "label_X_YY_smm", "label_X_YY_qmm", "label_X_YY_gmm", "label_X_YY_btauhtaue", "label_X_YY_ctauhtaue", "label_X_YY_stauhtaue", "label_X_YY_qtauhtaue", "label_X_YY_gtauhtaue", "label_X_YY_btauhtaum", "label_X_YY_ctauhtaum", "label_X_YY_stauhtaum", "label_X_YY_qtauhtaum", "label_X_YY_gtauhtaum", "label_X_YY_btauhtauh", "label_X_YY_ctauhtauh", "label_X_YY_stauhtauh", "label_X_YY_qtauhtauh", "label_X_YY_gtauhtauh", "label_X_YY_qqqb", "label_X_YY_qqqc", "label_X_YY_qqqs", "label_X_YY_bbcq", "label_X_YY_ccbs", "label_X_YY_ccbq", "label_X_YY_ccsq", "label_X_YY_sscq", "label_X_YY_qqbc", "label_X_YY_qqbs", "label_X_YY_qqcs", "label_X_YY_bcsq", "label_X_YY_bcs", "label_X_YY_bcq", "label_X_YY_bsq", "label_X_YY_csq", "label_X_YY_bcev", "label_X_YY_csev", "label_X_YY_bqev", "label_X_YY_cqev", "label_X_YY_sqev", "label_X_YY_qqev", "label_X_YY_bcmv", "label_X_YY_csmv", "label_X_YY_bqmv", "label_X_YY_cqmv", "label_X_YY_sqmv", "label_X_YY_qqmv", "label_X_YY_bctauev", "label_X_YY_cstauev", "label_X_YY_bqtauev", "label_X_YY_cqtauev", "label_X_YY_sqtauev", "label_X_YY_qqtauev", "label_X_YY_bctaumv", "label_X_YY_cstaumv", "label_X_YY_bqtaumv", "label_X_YY_cqtaumv", "label_X_YY_sqtaumv", "label_X_YY_qqtaumv", "label_X_YY_bctauhv", "label_X_YY_cstauhv", "label_X_YY_bqtauhv", "label_X_YY_cqtauhv", "label_X_YY_sqtauhv", "label_X_YY_qqtauhv", "label_QCD_bbccss", "label_QCD_bbccs", "label_QCD_bbcc", "label_QCD_bbcss", "label_QCD_bbcs", "label_QCD_bbc", "label_QCD_bbss", "label_QCD_bbs", "label_QCD_bb", "label_QCD_bccss", "label_QCD_bccs", "label_QCD_bcc", "label_QCD_bcss", "label_QCD_bcs", "label_QCD_bc", "label_QCD_bss", "label_QCD_bs", "label_QCD_b", "label_QCD_ccss", "label_QCD_ccs", "label_QCD_cc", "label_QCD_css", "label_QCD_cs", "label_QCD_c", "label_QCD_ss", "label_QCD_s", "label_QCD_light"]
+
+    label_cls_nodes = network_options.get('label_cls_nodes', label_sophon_default)
+    label_stored = network_options.get('label_stored', label_cls_nodes) # by default, store all classification node scores
+
+    output = {}
+    output['cls_index'] = labels['truth_label'] # classes can be too many, only store the index
+    for idx, label_name in enumerate(label_cls_nodes):
+        if label_name in label_stored:
+            output[label_name] = (labels['truth_label'] == idx)
+            output['score_' + label_name] = scores[:, idx]
+
+    for k, v in labels.items():
+        if k == data_config.label_names[0]:
+            continue
+        assert v.ndim == 1
+        output[k] = v
+    for k, v in observers.items():
+        assert v.ndim == 1
+        output[k] = v
+    
+    for k in output.keys():
+        print(k, output[k])
+
+    return output
