@@ -43,6 +43,15 @@ def construct_jagged(target, length, builder):
 
 def _read_root(filepath, branches, load_range=None, treename=None):
     '''
+    specific_vars = {
+        "'ggHH_kl_1_kt_1' in filepath": {'event_class': 0},
+        "'ggHH_kl_0_kt_1' in filepath": {'event_class': 1},
+        "'ggHH_kl_2p45_kt_1' in filepath": {'event_class': 2},
+        "'ggHH_kl_5_kt_1' in filepath": {'event_class': 3},
+    }
+    specific_vars_included = {}
+    '''
+    '''
     # for training with v4 and v5
     specific_vars = {
         # keywords: variable list
@@ -238,6 +247,7 @@ def _read_root(filepath, branches, load_range=None, treename=None):
     }
     specific_vars_included = {}
     '''
+
     specific_vars = {}
     specific_vars_included = {}
 

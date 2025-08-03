@@ -544,14 +544,18 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
         scores_dict = {
             'Xbb': scores[:, 0],
             'Xcc': scores[:, 1],
+            'Xss': scores[:, 2],
+            'Xgg': scores[:, 9],
             'QCD': np.sum(scores[:, 161:188], axis=1), # sum of the last 27 scores to form the QCD score
         }
         flag_dict = {
             'Xbb': labels['truth_label'] == 0,
             'Xcc': labels['truth_label'] == 1,
+            'Xss': labels['truth_label'] == 2,
+            'Xgg': labels['truth_label'] == 9,
             'QCD': (labels['truth_label'] >= 161) & (labels['truth_label'] < 188),
         }
-        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
+        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xss', 'QCD'), ('Xgg', 'QCD')] # ROC curves for A vs B
         bkgrej = {}
 
         f, ax = plt.subplots(figsize=(5, 5))
