@@ -248,6 +248,7 @@ def _read_root(filepath, branches, load_range=None, treename=None):
     specific_vars_included = {}
     '''
     # for CLIP's fine-tuning test
+    
     specific_vars = {
         "'ggHH_kl_1_kt_1' in filepath": {'event_class': 0},
         "'ggHH_kl_0_kt_1' in filepath": {'event_class': 1},
@@ -259,8 +260,9 @@ def _read_root(filepath, branches, load_range=None, treename=None):
         "'train_hyy4q_fixmassrat_0p8' in filepath": {'jet_label': 10003},
     }
     specific_vars_included = {}
-    # specific_vars = {}
-    # specific_vars_included = {}
+    
+    #specific_vars = {}
+    #specific_vars_included = {}
 
     def remove_branch(branches, filepath):
         for expr, new_branch_dict in specific_vars.items():
