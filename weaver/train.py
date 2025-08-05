@@ -99,6 +99,10 @@ parser.add_argument('-m', '--model-prefix', type=str, default='models/{auto}/net
                          'based on the timestamp and network configuration')
 parser.add_argument('--load-model-weights', type=str, default=None,
                     help='initialize model with pre-trained weights')
+parser.add_argument('--load-model-weights-grouped', nargs='+', default=None,
+                    help='initialize model with multiple pre-trained weights. Each argument should be a 3-tuple: (path, regex_match, string). '
+                         'path: model path to load with torch.load; regex_match: regex to match model_state keys; '
+                         'string: replacement string for the first match. All model states will be merged.')
 parser.add_argument('--exclude-model-weights', type=str, default=None,
                     help='comma-separated regex to exclude matched weights from being loaded, e.g., `a.fc..+,b.fc..+`')
 parser.add_argument('--freeze-model-weights', type=str, default=None,
@@ -756,6 +760,60 @@ def model_setup(args, data_config):
             missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
             _logger.info('Model initialized with weights from %s\n ... Missing: %s\n ... Unexpected: %s' %
                         (args.load_model_weights, missing_keys, unexpected_keys))
+    
+    # Handle grouped model weights loading
+    if args.load_model_weights_grouped:
+
+        import re
+        # Initialize merged model state
+        merged_model_state = {}
+        
+        # Process each grouped weight argument
+        for arg in args.load_model_weights_grouped:
+            try:
+                # Parse the 3-tuple: (path, regex_match, string)
+                path, regex_match, replacement_string = ast.literal_eval(arg)
+                
+                # Load model state from path
+                model_state = torch.load(path, map_location='cpu')
+                _logger.info(f'Loaded model state from {path}, regex_match: {regex_match}, replacement_string: {replacement_string}')
+
+                # Apply regex replacement to keys
+                for key, value in model_state.items():
+                    if re.match(regex_match, key):
+                        # Replace the first match with replacement_string
+                        new_key = re.sub(regex_match, replacement_string, key, count=1)
+                        merged_model_state[new_key] = value
+                        # print(f' - Key mapping: {key} -> {new_key}')
+                    else:
+                        # Keep original key if no match
+                        merged_model_state[key] = value
+                        
+            except (ValueError, SyntaxError) as e:
+                _logger.error(f'Failed to parse grouped weight argument "{arg}": {e}')
+                continue
+            except Exception as e:
+                _logger.error(f'Failed to load model from grouped weight argument "{arg}": {e}')
+                continue
+        
+        # Apply exclude patterns if specified
+        if args.exclude_model_weights:
+            exclude_patterns = args.exclude_model_weights.split(',')
+            _logger.info('The following weights will not be loaded: %s' % str(exclude_patterns))
+            key_state = {}
+            for k in merged_model_state.keys():
+                key_state[k] = True
+                for pattern in exclude_patterns:
+                    if re.match(pattern, k):
+                        key_state[k] = False
+                        break
+            merged_model_state = {k: v for k, v in merged_model_state.items() if key_state[k]}
+        
+        # Load the merged state dict
+        missing_keys, unexpected_keys = model.load_state_dict(merged_model_state, strict=False)
+        _logger.info('Model initialized with grouped weights\n ... Missing: %s\n ... Unexpected: %s' %
+                    (missing_keys, unexpected_keys))
+    
     if args.freeze_model_weights:
         import re
         freeze_patterns = args.freeze_model_weights.split(',')
