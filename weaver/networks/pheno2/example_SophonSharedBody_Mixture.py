@@ -29,6 +29,7 @@ This code is modified from example_Sophon.py
  - define FC layer outside of the main ParT body
  - allow custom merge_after_nth_layer
  - support multiple models with concatenated hidden layers (specified by num_models)
+ - support init_model_weights parameter for loading pre-trained weights for multiple models
  - new eval/test utilities: custom BkgRej maker; custom label_cls_nodes and label_stored for saving outpout nodes
 '''
 
@@ -54,6 +55,7 @@ class ParticleTransformerSophonSharedBodyWrapper(torch.nn.Module):
         self.merge_after_nth_layer = kwargs.pop('merge_after_nth_layer', -1)
         self.freeze_mode = kwargs.pop('freeze_mode', False)
         self.num_models = kwargs.pop('num_models', 1)
+        self.init_model_weights = kwargs.pop('init_model_weights', None)
 
         fc_params = kwargs.get('fc_params', None)
         kwargs['fc_params'] = None
@@ -65,6 +67,67 @@ class ParticleTransformerSophonSharedBodyWrapper(torch.nn.Module):
         
         # FC layers will take concatenated hidden dimensions from all models
         self.fc_layers = ffn_layers(input_dim=self.num_models * kwargs['embed_dims'][-1], output_dim=kwargs['num_classes'], fc_params=fc_params, bias_last=True)
+
+        # Initialize model weights if specified
+        if self.init_model_weights is not None:
+            self._init_model_weights()
+
+    def _init_model_weights(self):
+        """Initialize model weights from pre-trained models"""
+        import re
+        import torch
+        
+        if len(self.init_model_weights) != self.num_models:
+            raise ValueError(f'init_model_weights must have {self.num_models} tuples, got {len(self.init_model_weights)}')
+        
+        model_state_processed = {}
+        for model_idx, (path, fc_src, fc_tgt, fc_load_list) in enumerate(self.init_model_weights):
+            _logger.info(f'Loading weights for model {model_idx} from {path}')
+            
+            # Load model state
+            model_state = torch.load(path, map_location='cpu')
+            
+            # Load all mod.* parameters, except mod.fc.*
+            for key, value in model_state.items():
+                if key.startswith('mod.') and not key.startswith('mod.fc.'):
+                    new_key = key.replace('mod.', f'models.{model_idx}.', 1)
+                    model_state_processed[new_key] = value
+                # if 'fc' in key:
+                #     print('!!', model_idx, key, value.shape)
+
+            # Handle FC layer loading
+            if fc_load_list is not None:
+                # Load specific FC layers
+                for fc_load_str in fc_load_list:
+                    if ":" in fc_load_str:
+                        fc_name, fc_layer_inds = fc_load_str.split(":")
+                        fc_layer_inds = [int(ind) for ind in fc_layer_inds.split(",")]
+                    else:
+                        fc_name = fc_load_str
+                        fc_layer_inds = None
+                    
+                    fc_name_src = f'{fc_src}.{fc_name}'
+                    fc_name_tgt = f'{fc_tgt}.{fc_name}'
+                    
+                    for key, value in model_state.items():
+                        if key.startswith(fc_name_src):
+                            # Map FC layer keys
+                            new_key = key.replace(fc_name_src, fc_name_tgt)
+                            if new_key in model_state_processed:
+                                _logger.warning(f'FC layer {new_key} already exists in model {model_idx}. Is it expected?')
+                            model_state_processed[new_key] = value
+
+                            # Select specific indices if specified
+                            if fc_layer_inds is not None:
+                                model_state_processed[new_key] = value[..., fc_layer_inds]
+
+                            _logger.info(f'FC mapping: {key} -> {new_key}, FC layer indices if specified: {fc_layer_inds}')
+
+        # Load the processed state dict
+        missing_keys, unexpected_keys = self.load_state_dict(model_state_processed, strict=False)
+        if len(unexpected_keys) > 0:
+            raise ValueError(f'Unexpected keys in model {model_idx}: {unexpected_keys}')
+        _logger.info(f'Model {model_idx} initialization:\n  Missing: {missing_keys}\n  Unexpected: {unexpected_keys}')
 
     @torch.jit.ignore
     def no_weight_decay(self):
