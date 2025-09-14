@@ -18,22 +18,22 @@ if [[ "$current_dir" != *"weaver-core/weaver" ]]; then
 fi
 
 # prepare training dataset
-#  WCharge dataset, train:val:test = 64:16:16
-trainset_x2p=$(for i in $(seq 0 63); do echo -n "X2p:${DATADIR_X2P}/train_wqq_sm_ntuple/ntuples_$i.root "; done)
-valset_x2p=$(for i in $(seq 64 79); do echo -n "X2p:${DATADIR_X2P}/train_wqq_sm_ntuple/ntuples_$i.root "; done)
-testset_x2p=$(for i in $(seq 80 95); do echo -n "X2p:${DATADIR_X2P}/train_wqq_sm_ntuple/ntuples_$i.root "; done)
+#  XWW dataset, train:val:test = 64:16:16
+trainset_xww=$(for n in 0p2 0p4 0p6432 0p8; do for i in $(seq 0 63); do echo -n "XWW_rat${n}:${DATADIR_HWW}/train_hyy4q_fixmassrat_${n}_ntuple/ntuples_$i.root "; done; done)
+valset_xww=$(for n in 0p2 0p4 0p6432 0p8; do for i in $(seq 64 79); do echo -n "XWW_rat${n}:${DATADIR_HWW}/train_hyy4q_fixmassrat_${n}_ntuple/ntuples_$i.root "; done; done)
+testset_xww=$(for n in 0p2 0p4 0p6432 0p8; do for i in $(seq 80 95); do echo -n "XWW_rat${n}:${DATADIR_HWW}/train_hyy4q_fixmassrat_${n}_ntuple/ntuples_$i.root "; done; done)
 
 #  QCD dataset, train:val:test = 56:14:14 (1/5 of JetClassII dataset)
 trainset_qcd=$(for i in $(seq -w 0000 0055); do echo -n "QCD:${DATADIR}/Pythia/QCD_$i.parquet "; done)
 valset_qcd=$(for i in $(seq -w 0280 0293); do echo -n "QCD:${DATADIR}/Pythia/QCD_$i.parquet "; done)
 testset_qcd=$(for i in $(seq -w 0350 0363); do echo -n "QCD:${DATADIR}/Pythia/QCD_$i.parquet "; done)
 
-ARG="--network-config networks/pheno2/example_SophonSharedBody.py -o num_classes 3 -o fc_params [(512,0.1)] \
+ARG="--network-config networks/pheno2/example_SophonSharedBody.py -o num_classes 4 -o fc_params [(512,0.1)] \
 --use-amp --batch-size 512 --start-lr 5e-4 --samples-per-epoch $((2000 * 1024 / $NGPUS)) --samples-per-epoch-val $((2500 * 1024 / $NGPUS)) --num-epochs 20 --optimizer ranger \
 --num-workers 4 --fetch-step 1.0 --data-split-num 100 \
---data-train $trainset_x2p $trainset_qcd \
---data-val $valset_x2p $valset_qcd \
---data-test $testset_x2p $testset_qcd \
+--data-train $trainset_xww \
+--data-val $valset_xww \
+--data-test $testset_xww \
 --data-config $config \
 --model-prefix model/${PREFIX}/net \
 --predict-output predict/$PREFIX/pred.root "

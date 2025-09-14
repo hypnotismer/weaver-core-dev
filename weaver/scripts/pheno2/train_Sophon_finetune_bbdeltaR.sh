@@ -20,12 +20,14 @@ fi
 # prepare training dataset
 trainset_res2p=$(for i in $(seq -w 0000 0199); do echo -n "Res2P:${DATADIR}/Pythia/Res2P_$i.parquet "; done)
 valset_res2p=$(for i in $(seq -w 0200 0249); do echo -n "Res2P:${DATADIR}/Pythia/Res2P_$i.parquet "; done)
+testset_res2p=$(for i in $(seq -w 0250 0299); do echo -n "Res2P:${DATADIR}/Pythia/Res2P_$i.parquet "; done)
 
 ARG="--network-config networks/pheno2/example_SophonSharedBody.py -o num_classes 10 -o fc_params [(512,0.1)] \
 --use-amp --batch-size 512 --start-lr 5e-4 --samples-per-epoch $((5000 * 1024 / $NGPUS)) --samples-per-epoch-val $((2500 * 1024 / $NGPUS)) --num-epochs 20 --optimizer ranger \
 --num-workers 3 --fetch-step 1.0 --data-split-num 50 \
 --data-train $trainset_res2p \
 --data-val $valset_res2p \
+--data-test $testset_res2p \
 --data-config $config \
 --model-prefix model/${PREFIX}/net \
 --predict-output predict/$PREFIX/pred.root "

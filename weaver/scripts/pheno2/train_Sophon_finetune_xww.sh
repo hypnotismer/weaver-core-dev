@@ -29,8 +29,8 @@ valset_qcd=$(for i in $(seq -w 0280 0293); do echo -n "QCD:${DATADIR}/Pythia/QCD
 testset_qcd=$(for i in $(seq -w 0350 0363); do echo -n "QCD:${DATADIR}/Pythia/QCD_$i.parquet "; done)
 
 ARG="--network-config networks/pheno2/example_SophonSharedBody.py -o num_classes 5 -o fc_params [(512,0.1)] \
---use-amp --batch-size 512 --start-lr 5e-4 --samples-per-epoch $((5000 * 1024 / $NGPUS)) --samples-per-epoch-val $((2500 * 1024 / $NGPUS)) --num-epochs 20 --optimizer ranger \
---num-workers 4 --fetch-step 1.0 --data-split-num 50 \
+--use-amp --batch-size 512 --start-lr 5e-4 --samples-per-epoch $((2000 * 1024 / $NGPUS)) --samples-per-epoch-val $((2500 * 1024 / $NGPUS)) --num-epochs 20 --optimizer ranger \
+--num-workers 4 --fetch-step 1.0 --data-split-num 100 \
 --data-train $trainset_xww $trainset_qcd \
 --data-val $valset_xww $valset_qcd \
 --data-test $testset_xww $testset_qcd \

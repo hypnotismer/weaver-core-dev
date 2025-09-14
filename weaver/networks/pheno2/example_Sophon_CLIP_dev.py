@@ -21,7 +21,66 @@ from utils.nn.tools import (
 )
 from utils.import_tools import import_module
 
-ParticleTransformer = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT').ParticleTransformer
+ParT = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT')
+
+
+class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
+    """
+    在保持 ParticleTransformer2024Plus 不变的前提下，扩展一个可选功能：
+    - 在经过 encoder 的自注意力堆叠（例如 8 个 blocks）后，支持两条独立的 class attention 分支，
+      分别用于分类与对比学习（CLIP），而非共享一套 class attention blocks。
+
+    兼容性：
+    - 默认行为与原版完全一致（dual_cls_blocks=False）。
+    - 当 dual_cls_blocks=True 且 num_cls_tokens>=2 时：
+      使用第 1 个 cls token 经过原有 self.cls_blocks（用于分类），
+      第 2 个 cls token 经过一套独立的 self.cls_blocks_aux（用于对比学习），
+      最终返回形状为 (batch, 2, embed_dim) 的 class token 表征，与现有 wrapper 的接口保持一致。
+    """
+
+    def __init__(self, **kwargs) -> None:
+        # 取出自定义开关，避免传递给父类
+        dual_cls_blocks = kwargs.pop('dual_cls_blocks', False)
+        super().__init__(**kwargs)
+        self.dual_cls_blocks = dual_cls_blocks
+
+        # 仅在开启双分支且存在 cls_blocks 时，克隆一套独立的 class blocks
+        if self.dual_cls_blocks and (self.cls_blocks is not None):
+            # 深拷贝，确保两条分支参数独立
+            self.cls_blocks_aux = copy.deepcopy(self.cls_blocks)
+        else:
+            self.cls_blocks_aux = None
+
+    def _forward_aggregator(self, x, padding_mask):
+        # 若未开启双分支，沿用原版逻辑
+        if not self.dual_cls_blocks or (self.cls_blocks is None):
+            return super()._forward_aggregator(x, padding_mask)
+
+        # 双分支：要求至少有两个 cls tokens（第 1 个用于分类，第 2 个用于对比学习）
+        with torch.autocast('cuda', enabled=self.use_amp):
+            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (batch, num_cls_token, embed_dim)
+            if cls_tokens.size(1) < 2:
+                # 不足两个 token 时，退回原版聚合器
+                return super()._forward_aggregator(x, padding_mask)
+
+            # 拆分两条独立分支的起始 cls token
+            cls_token_main = cls_tokens[:, 0:1, :]
+            cls_token_aux = cls_tokens[:, 1:2, :]
+
+            # 主分支（用于分类）：使用原有 cls_blocks
+            for block in self.cls_blocks:
+                cls_token_main = block(x, x_cls=cls_token_main, padding_mask=padding_mask)
+
+            # 辅分支（用于对比学习）：使用独立的 cls_blocks_aux
+            if self.cls_blocks_aux is None:
+                self.cls_blocks_aux = copy.deepcopy(self.cls_blocks)
+            for block in self.cls_blocks_aux:
+                cls_token_aux = block(x, x_cls=cls_token_aux, padding_mask=padding_mask)
+
+            # 分别归一化并各自返回 (batch, embed_dim)
+            x_main = self.norm(cls_token_main.squeeze(1))
+            x_aux = self.norm(cls_token_aux.squeeze(1))
+        return x_main, x_aux
 
 '''
 This code is adapted from Sophon's official repository: https://github.com/jet-universe/sophon/blob/main/networks/example_ParticleTransformer_sophon.py
@@ -73,8 +132,11 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                 gen_model_kw['num_cls_tokens'] = 2
 
             # initialize model
-            self.mod = ParticleTransformer(**kwargs)
-            self.gen = ParticleTransformer(**gen_model_kw)
+            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）
+            if self.clip_mode == 'clip-with-cls' and clip_kw.get('dual_cls_blocks', False):
+                kwargs['dual_cls_blocks'] = True
+            self.mod = ParticleTransformer_dual_cls(**kwargs)
+            self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
 
             # define outer FCs
             self.mod_proj = FFN(input_dim=kwargs['embed_dims'][-1], output_dim=clip_kw['proj_dim'], fc_params=clip_kw['main_cont_fc_parmas'], bias_last=False)
@@ -89,7 +151,7 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
         elif self.clip_mode in ['cls-only', 'clip-finetune']:
 
-            self.mod = ParticleTransformer(**kwargs)
+            self.mod = ParticleTransformer_dual_cls(**kwargs)
 
             # initialize model for clip-finetune mode
             assert clip_kw['init_path'] is not None, 'init_path must be provided for clip-finetune mode'
@@ -110,7 +172,7 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
             _logger.info('Loaded model state from %s: missing keys %s, unexpected keys %s' % (clip_kw['init_path'], missing, unexpected))
 
         elif self.clip_mode in ['gencls-only']:
-            self.gen = ParticleTransformer(**gen_model_kw)
+            self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -134,42 +196,82 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
         if self.clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
             points, features, lorentz_vectors, mask, gen_points, gen_features, gen_lorentz_vectors, gen_mask = args
-            x_mod = self.mod(features, v=lorentz_vectors, mask=mask) # class token output
-            x_gen = self.gen(gen_features, v=gen_lorentz_vectors, mask=gen_mask) # class token output
+
+            x_mod_out = self.mod(features, v=lorentz_vectors, mask=mask)
+            x_gen_out = self.gen(gen_features, v=gen_lorentz_vectors, mask=gen_mask)
+
+            # 工具函数：从可能的 (tensor or tuple or (bsz,2,dim)) 中取分类分支与对比分支
+            def split_outputs(x):
+                if isinstance(x, tuple) and len(x) == 2:
+                    return x[0], x[1]
+                if torch.is_tensor(x):
+                    if x.ndim == 3 and x.size(1) == 2:
+                        return x[:, 0], x[:, 1]
+                    elif x.ndim == 2:
+                        return x, x
+                raise AssertionError('Unexpected output shape/type: %s' % (str(type(x)) + ((' ' + str(tuple(x.shape))) if torch.is_tensor(x) else '')))
 
             # FC (for classifications) and projections (for contrastive loss)
             if self.clip_mode == 'clip-with-cls':
                 if not self.clip_share_token:
-                    # separate class tokens for classification and CLIP contrastive loss
-                    assert len(x_mod.shape) == 3 and x_mod.shape[1] == 2, 'Invalid shape %s' % str(x_mod.shape) # dim: (bsz, 2, dim)
-                    logits = self.mod_fc(x_mod[:, 0])
-                    x_mod = self.mod_proj(x_mod[:, 1])
-                    x_gen = self.gen_proj(x_gen)
+                    # 主模型：分类与对比两路分支
+                    x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
+                    logits = self.mod_fc(x_mod_cls)
+                    x_mod = self.mod_proj(x_mod_clip)
+
+                    # gen模型：只用于对比分支，若返回双分支，取对比路
+                    if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
+                        _, x_gen_clip = x_gen_out
+                    elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
+                        x_gen_clip = x_gen_out[:, 1]
+                    else:
+                        x_gen_clip = x_gen_out
+                    x_gen = self.gen_proj(x_gen_clip)
                 else:
-                    # use a shared class token for both classification and CLIP contrastive loss
-                    assert len(x_mod.shape) == 2, 'Invalid shape %s' % str(x_mod.shape) # dim: (bsz, dim)
-                    logits = self.mod_fc(x_mod)
-                    x_mod = self.mod_proj(x_mod)
-                    x_gen = self.gen_proj(x_gen)
-            
+                    # 共享一套表征
+                    assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
+                    logits = self.mod_fc(x_mod_out)
+                    x_mod = self.mod_proj(x_mod_out)
+                    x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
+
             elif self.clip_mode == 'clip-with-gencls':
                 if not self.clip_share_token:
-                    # separate class tokens for classification and CLIP contrastive loss
-                    assert len(x_gen.shape) == 3 and x_gen.shape[1] == 2, 'Invalid shape %s' % str(x_gen.shape) # dim: (bsz, 2, dim)
-                    logits = self.gen_fc(x_gen[:, 0])
-                    x_mod = self.mod_proj(x_mod)
-                    x_gen = self.gen_proj(x_gen[:, 1])
+                    # 生成模型：分类与对比两路分支
+                    x_gen_cls, x_gen_clip = split_outputs(x_gen_out)
+                    logits = self.gen_fc(x_gen_cls)
+                    x_gen = self.gen_proj(x_gen_clip)
+
+                    # 主模型：只用于对比分支
+                    if isinstance(x_mod_out, tuple) and len(x_mod_out) == 2:
+                        _, x_mod_clip = x_mod_out
+                    elif torch.is_tensor(x_mod_out) and x_mod_out.ndim == 3 and x_mod_out.size(1) == 2:
+                        x_mod_clip = x_mod_out[:, 1]
+                    else:
+                        x_mod_clip = x_mod_out
+                    x_mod = self.mod_proj(x_mod_clip)
                 else:
-                    # use a shared class token for both classification and CLIP contrastive loss
-                    assert len(x_gen.shape) == 2, 'Invalid shape %s' % str(x_gen.shape) # dim: (bsz, dim)
-                    logits = self.gen_fc(x_gen)
-                    x_mod = self.mod_proj(x_mod)
-                    x_gen = self.gen_proj(x_gen)
+                    # 共享一套表征
+                    assert torch.is_tensor(x_gen_out) and x_gen_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_gen_out, 'shape', None))
+                    logits = self.gen_fc(x_gen_out)
+                    x_mod = self.mod_proj(x_mod_out if torch.is_tensor(x_mod_out) else x_mod_out[1] if isinstance(x_mod_out, tuple) else x_mod_out)
+                    x_gen = self.gen_proj(x_gen_out)
 
             elif self.clip_mode == 'clip-only':
                 logits = None
-                x_mod = self.mod_proj(x_mod)
-                x_gen = self.gen_proj(x_gen)
+                # 仅对比学习：若为双分支，取对比路
+                if isinstance(x_mod_out, tuple) and len(x_mod_out) == 2:
+                    x_mod = self.mod_proj(x_mod_out[1])
+                elif torch.is_tensor(x_mod_out) and x_mod_out.ndim == 3 and x_mod_out.size(1) == 2:
+                    x_mod = self.mod_proj(x_mod_out[:, 1])
+                else:
+                    x_mod = self.mod_proj(x_mod_out)
+
+                if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
+                    x_gen = self.gen_proj(x_gen_out[1])
+                elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
+                    x_gen = self.gen_proj(x_gen_out[:, 1])
+                else:
+                    x_gen = self.gen_proj(x_gen_out)
 
         elif self.clip_mode in ['cls-only', 'clip-finetune']:
             points, features, lorentz_vectors, mask = args
@@ -221,6 +323,17 @@ class CLIPLoss(torch.nn.Module):
             # compute cosine similarity
             logit_scale = self.logit_scale.exp()
             logits_cont_2d = logit_scale * x_mod @ x_gen.t() # (batch, batch)
+            
+            # 根据 labels >= 161 的条件，创建掩码去除 gen 维度对应的行
+            # 当 labels >= 161 时，对应的样本在 gen 维度上应该被排除
+            mask_gen = labels < 161  # True 表示保留，False 表示排除
+            if not mask_gen.all():  # 如果有需要排除的样本
+                # 创建掩码矩阵，排除 labels >= 161 对应的行
+                mask_matrix = mask_gen.unsqueeze(0).expand(logits_cont_2d.size(0), -1)  # (batch, batch)
+                logits_cont_2d = logits_cont_2d.masked_fill(~mask_matrix, 1e-9)
+            
+            #print(logits_cont_2d)
+            #breakpoint()
             logits_cont_2d_t = logits_cont_2d.t()
             indices = torch.arange(x_mod.size(0)).to(x_mod.device) # (batch,)
 
@@ -282,6 +395,7 @@ def get_model(data_config, **kwargs):
         mode='clip-only',
         proj_dim=128,
         share_token=False,
+        dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
         enlarge=False,
         gen_enlarge=True,
         exclude=[],
@@ -304,19 +418,9 @@ def get_model(data_config, **kwargs):
         assert k in cfg, 'Invalid key %s' % k
         cfg[k] = v
     
-    if cfg['clip_kw']['enlarge']:
-        cfg.update(
-        embed_dims=[256, 1024, 256],
-        pair_embed_dims=[128, 128, 128],
-        num_heads=16
-        )
-
-    if cfg['clip_kw']['gen_enlarge']:
-        cfg['gen_model_kw'].update(
-        embed_dims=[128, 512, 128],
-        pair_embed_dims=[64, 64, 64],
-        num_heads=8,
-        )
+    # 仅在 clip-with-cls 且不共享 token 时，启用 dual_cls_blocks（开关位于 clip_kw）
+    if cfg['clip_kw']['mode'] == 'clip-with-cls' and (not cfg['clip_kw']['share_token']):
+        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', True)
 
     _logger.info('Model config: %s' % str(cfg))
 
