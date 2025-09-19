@@ -163,21 +163,38 @@ class WeightMaker(object):
         self.keep_branches = set(self._data_config.reweight_branches + self._data_config.reweight_classes +
                                  (self._data_config.basewgt_name,))
         self.load_branches = set()
-        for k in self.keep_branches:
-            if k in self._data_config.var_funcs:
-                expr = self._data_config.var_funcs[k]
-                self.load_branches.update(_get_variable_names(expr))
+        
+        # 递归收集所有依赖的新变量
+        def collect_dependencies(var_name, collected_vars):
+            if var_name in collected_vars:
+                return
+            collected_vars.add(var_name)
+            if var_name in self._data_config.var_funcs:
+                expr = self._data_config.var_funcs[var_name]
+                dependencies = _get_variable_names(expr)
+                for dep in dependencies:
+                    if dep in self._data_config.var_funcs:
+                        collect_dependencies(dep, collected_vars)
+                    else:
+                        self.load_branches.add(dep)
             else:
-                self.load_branches.add(k)
+                self.load_branches.add(var_name)
+        
+        # 收集所有需要的新变量及其依赖
+        all_needed_vars = set()
+        for k in self.keep_branches:
+            collect_dependencies(k, all_needed_vars)
+        
         if self._data_config.selection:
             self.load_branches.update(_get_variable_names(self._data_config.selection))
         _logger.debug('[WeightMaker] keep_branches:\n  %s', ','.join(self.keep_branches))
+        _logger.debug('[WeightMaker] all_needed_vars:\n  %s', ','.join(all_needed_vars))
         _logger.debug('[WeightMaker] load_branches:\n  %s', ','.join(self.load_branches))
         table = _read_files(filelist, self.load_branches, show_progressbar=True, treename=self._data_config.treename)
         table = _apply_selection(table, self._data_config.selection)
         table = _build_new_variables(
-            table, {k: v for k, v in self._data_config.var_funcs.items() if k in self.keep_branches})
-        table = _clean_up(table, self.load_branches - self.keep_branches)
+            table, {k: v for k, v in self._data_config.var_funcs.items() if k in all_needed_vars})
+        table = _clean_up(table, self.load_branches - all_needed_vars)
         return table
 
     def make_weights(self, table):
@@ -235,19 +252,40 @@ class WeightMaker(object):
                 # divide by classwgt here will effective increase the weight later
                 class_events[label] = np.sum(raw_hists[label] * wgt) / classwgt
         elif self._data_config.reweight_method == 'ref':
-            if self._data_config.reweight_hist_ref is not None:
-                hist_ref = np.array(self._data_config.reweight_hist_ref, dtype='float32')
-                assert hist_ref.shape == raw_hists[self._data_config.reweight_classes[0]].shape, \
+            # 支持两种形式：
+            # 1) 全局参考直方图（数组）：对所有类应用
+            # 2) 按类的参考直方图（字典）：仅对在字典中出现的类应用；其他类权重为全1
+            dict_ref = isinstance(getattr(self._data_config, 'reweight_hist_ref', None), dict)
+            if self._data_config.reweight_hist_ref is not None and not dict_ref:
+                hist_ref_global = np.array(self._data_config.reweight_hist_ref, dtype='float32')
+                assert hist_ref_global.shape == raw_hists[self._data_config.reweight_classes[0]].shape, \
                     'Error: shape of reference histogram does not match the shape of the reweighting histograms!'
-            else:
-                # use class 0 as the reference
-                hist_ref = raw_hists[self._data_config.reweight_classes[0]]
-            _logger.info('Using reweight method "ref". hist_ref:\n%s', str(hist_ref))
+                _logger.info('Using reweight method "ref" with a global hist_ref.')
+            elif self._data_config.reweight_hist_ref is None:
+                # use class 0 as the global reference if nothing provided
+                hist_ref_global = raw_hists[self._data_config.reweight_classes[0]]
+                _logger.info('Using reweight method "ref" with class-0 histogram as global reference.')
+            # 当使用字典形式时，逐类读取参考直方图
             for label, classwgt in zip(self._data_config.reweight_classes, self._data_config.class_weights):
-                # wgt: bins w/ 0 elements will get a weight of 0; bins w/ content<ref_val will get 1
-                ratio = np.nan_to_num(hist_ref / result[label], posinf=0)
-                upper = np.percentile(ratio[ratio > 0], 100 - self._data_config.reweight_threshold)
-                wgt = np.clip(ratio / upper, 0, 1)  # -> [0,1]
+                if dict_ref:
+                    refs: dict = self._data_config.reweight_hist_ref
+                    if label in refs and refs[label] is not None:
+                        hist_ref = np.array(refs[label], dtype='float32')
+                        assert hist_ref.shape == raw_hists[label].shape, \
+                            f'Error: shape of reference histogram for class {label} does not match!'
+                        ratio = np.nan_to_num(hist_ref / result[label], posinf=0)
+                        upper = np.percentile(ratio[ratio > 0], 100 - self._data_config.reweight_threshold)
+                        wgt = np.clip(ratio / upper, 0, 1)
+                        _logger.info('ref method applied to class %s.', label)
+                    else:
+                        # 未指定的类不做 reweight，使用单位权重
+                        wgt = np.ones_like(result[label], dtype='float32')
+                        _logger.info('ref method skipped for class %s (unit weights).', label)
+                else:
+                    # 全局参考：对所有类应用
+                    ratio = np.nan_to_num(hist_ref_global / result[label], posinf=0)
+                    upper = np.percentile(ratio[ratio > 0], 100 - self._data_config.reweight_threshold)
+                    wgt = np.clip(ratio / upper, 0, 1)
                 result[label] = wgt
                 # divide by classwgt here will effective increase the weight later
                 class_events[label] = np.sum(raw_hists[label] * wgt) / classwgt

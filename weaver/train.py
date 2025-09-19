@@ -735,6 +735,15 @@ def model_setup(args, data_config):
                 _logger.info('Model initialized with weights from GloParT v3beta4p1\n ... Missing: %s\n ... Unexpected: %s' %
                         (missing_keys, unexpected_keys))
 
+            ## load stage2 model
+            if args.load_model_weights == 'finetune_stage3_adaptstage2':
+                model_state = torch.load("./model/ak15_MD_inclv8_part_addltphp_wmeasonly.useamp.large.gm5.ddp-bs192-lr1p5e-3/net_best_epoch_state.pt", map_location='cpu')
+                model_state = {f'main.{k}': v for k, v in model_state.items()}
+                missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+                _logger.info('Model initialized with weights from GloParT v2 model\n ... Missing: %s\n ... Unexpected: %s' %
+                        (missing_keys, unexpected_keys))
+                assert len(unexpected_keys) == 0
+
         else:
             # this is the default setup
             if ':' in args.load_model_weights:

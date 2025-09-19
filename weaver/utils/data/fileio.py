@@ -258,6 +258,12 @@ def _read_root(filepath, branches, load_range=None, treename=None):
         "'train_hyy4q_fixmassrat_0p4' in filepath": {'jet_label': 10001},
         "'train_hyy4q_fixmassrat_0p6432' in filepath": {'jet_label': 10002},
         "'train_hyy4q_fixmassrat_0p8' in filepath": {'jet_label': 10003},
+        "'BulkGravitonToHHTo4Glu_MX-600to6000_MH-15to250' in filepath": {'event_label': 1000},
+        "'TTToSemiLeptonic_TuneCP5_13TeV-powheg-pythia8' in filepath": {'event_label': 2000},
+        "'WJetsToLNu_Pt-600ToInf_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 6000},
+        "'WJetsToLNu_Pt-400To600_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 5000},
+        "'WJetsToLNu_Pt-250To400_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 4000},
+        "'WJetsToLNu_Pt-100To250_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 3000},
     }
     specific_vars_included = {}
     
