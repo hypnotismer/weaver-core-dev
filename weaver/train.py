@@ -61,6 +61,8 @@ parser.add_argument('--data-fraction', type=float, default=1,
                     help='fraction of events to load from each file; for training, the events are randomly selected for each epoch')
 parser.add_argument('--data-split-num', type=int, default=1,
                     help='for each dataloader worker, split its dataset further into N parts when loading a certain fraction of each file. Setting N > 1 can reduce the workers\' memory usage.')
+parser.add_argument('--data-split-num-val', type=int, default=None,
+                    help='for each dataloader worker, split its validation dataset further into N parts when loading a certain fraction of each file. When not set, it will use the same value as --data-split-num.')
 parser.add_argument('--data-split-group', type=int, default=1,
                     help='Old name for --data-split-num.')
 parser.add_argument('--file-fraction', type=float, default=1,
@@ -270,7 +272,7 @@ def train_load(args):
                                    name='train' + ('' if args.local_rank is None else '_rank%d' % args.local_rank))
     val_data = SimpleIterDataset(val_file_dict, args.data_config, for_training=True,
                                  extra_selection=args.extra_selection_val,
-                                 load_range_and_fraction=(val_range, args.data_fraction, args.data_split_num),
+                                 load_range_and_fraction=(val_range, args.data_fraction, args.data_split_num_val if args.data_split_num_val is not None else args.data_split_num),
                                  file_fraction=args.file_fraction,
                                  fetch_by_files=args.fetch_by_files,
                                  fetch_step=args.fetch_step,
@@ -737,7 +739,7 @@ def model_setup(args, data_config):
 
             ## load stage2 model
             if args.load_model_weights == 'finetune_stage3_adaptstage2':
-                model_state = torch.load("./model/ak15_MD_inclv8_part_addltphp_wmeasonly.useamp.large.gm5.ddp-bs192-lr1p5e-3/net_best_epoch_state.pt", map_location='cpu')
+                model_state = torch.load("/afs/ihep.ac.cn/users/l/licq/publicfs/hww/incl-train/weaver-core/weaver/model/ak15_MD_inclv8_part_addltphp_wmeasonly.useamp.large.gm5.ddp-bs192-lr1p5e-3/net_best_epoch_state.pt", map_location='cpu')
                 model_state = {f'main.{k}': v for k, v in model_state.items()}
                 missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
                 _logger.info('Model initialized with weights from GloParT v2 model\n ... Missing: %s\n ... Unexpected: %s' %
