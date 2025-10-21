@@ -18,8 +18,9 @@ selection: >-
 test_time_selection: >-
     (jet_tightId==1) & (jet_no<2) &
     (
-      ((event_no%7==0) & (event_no%2==0)) |
-      ((event_no%7==0))
+      ((fj_label >= 309) & (fj_label < 314) & (event_no%7==0)) |
+      ((fj_label >= 0) & (fj_label <= 16) & (event_no%7==0)) |
+      (fj_label==24)
     )
 
 new_variables:
@@ -79,7 +80,7 @@ new_variables:
     #class for model training
     label_ttbar_Top: ((ft_label >= 2000) & (ft_label < 2017))
     label_ttbar_QCD: ((ft_label >= 2309) & (ft_label < 2314))
-    label_wjets_QCD: ((ft_label >= 3309) & (ft_label < 3314))
+    label_wjets_QCD: (((ft_label >= 3309) & (ft_label < 3314)) | ((ft_label >=4309) & (ft_label < 4314)) | ((ft_label >=5309) & (ft_label < 5314)) | ((ft_label >=6309) & (ft_label < 6314)))
     # classes for reweighting
     label_wjets_100-250: (event_label == 3000)
     label_wjets_250-400: (event_label == 4000)
@@ -122,7 +123,7 @@ preprocess:
 
 inputs:
     cpf_features:
-        length: 90
+        length: 110
         pad_mode: wrap
         vars:
             ### [format 1]: var_name (no transformation)
@@ -136,7 +137,7 @@ inputs:
             - [cpfcandlt_e_log_nopuppi_sort, 1.3, 0.5]
             - cpfcandlt_etarel_sort
             - cpfcandlt_phirel_sort
-            - [cpfcandlt_abseta_sort, 0.6, 1.6]
+            - [cpfcandlt_abseta_sort, 0.7, 1.4]
             - cpfcandlt_charge_sort
             - cpfcandlt_isEl_sort
             - cpfcandlt_isMu_sort
@@ -146,10 +147,10 @@ inputs:
             - cpfcandlt_lostInnerHits_sort
             - [cpfcandlt_normchi2_sort, 5, 0.2]
             - [cpfcandlt_quality_sort, 0, 0.2]
-            - [cpfcandlt_dz_sort, 0, 180]
-            - [cpfcandlt_dzsig_sort, 0, 0.9]
-            - [cpfcandlt_dxy_sort, 0.0, 300]
-            - [cpfcandlt_dxysig_sort, 0, 1.0]
+            - [cpfcandlt_dz_sort, 0, 130]
+            - [cpfcandlt_dzsig_sort, 0, 1.2]
+            - [cpfcandlt_dxy_sort, 0.0, 200]
+            - [cpfcandlt_dxysig_sort, 0, 1.6]
             - [cpfcandlt_btagEtaRel_sort, 1.5, 0.5]
             - [cpfcandlt_btagPtRatio_sort, 0, 1]
             - [cpfcandlt_btagPParRatio_sort, 0, 1]
@@ -163,7 +164,7 @@ inputs:
             - [cpfcandlt_stripTIDLayersWithMeasurement_sort, 0, 0.1]
             - [cpfcandlt_stripTOBLayersWithMeasurement_sort, 0, 0.1]
     cpf_vectors:
-        length: 90
+        length: 110
         pad_mode: wrap
         vars:
             - [cpfcandlt_px_sort, null]
@@ -171,23 +172,23 @@ inputs:
             - [cpfcandlt_pz_sort, null]
             - [cpfcandlt_energy_sort, null]
     cpf_mask:
-        length: 90
+        length: 110
         pad_mode: constant
         vars:
             - cpfcandlt_mask
     npf_features:
-        length: 60
+        length: 75
         pad_mode: wrap
         vars:
             - [npfcand_pt_log_nopuppi, 1, 0.5]
             - [npfcand_e_log_nopuppi, 1.3, 0.5]
             - npfcand_etarel
             - npfcand_phirel
-            - [npfcand_abseta, 0.6, 1.6]
+            - [npfcand_abseta, 0.7, 1.4]
             - npfcand_isGamma
             - npfcand_isNeutralHad
     npf_vectors:
-        length: 60
+        length: 75
         pad_mode: wrap
         vars:
             - [npfcand_px, null]
@@ -195,7 +196,7 @@ inputs:
             - [npfcand_pz, null]
             - [npfcand_energy, null]
     npf_mask:
-        length: 60
+        length: 75
         pad_mode: constant
         vars:
             - npfcand_mask
@@ -253,41 +254,7 @@ observers:
     - fj_phi
     - fj_mass
     - fj_sdmass
-    - fj_sdmass_fromsubjets
-    - fj_gen_mass
-    - fj_genparts_mass
-    - fj_genjet_sdmass
-    - fj_genjet_nomu_sdmass
-    - sample_isQCD
-    - pfParticleNetMassRegressionJetTags_mass
-    - pfMassDecorrelatedParticleNetJetTags_probXbb
-    - pfMassDecorrelatedParticleNetJetTags_probXcc
-    - pfMassDecorrelatedParticleNetJetTags_probXqq
-    - pfMassDecorrelatedParticleNetJetTags_probQCDb
-    - pfMassDecorrelatedParticleNetJetTags_probQCDbb
-    - pfMassDecorrelatedParticleNetJetTags_probQCDc
-    - pfMassDecorrelatedParticleNetJetTags_probQCDcc
-    - pfMassDecorrelatedParticleNetJetTags_probQCDothers
-    - pfParticleNetJetTags_probHbb
-    - pfParticleNetJetTags_probHcc
-    - pfParticleNetJetTags_probHqqqq
-    - pfParticleNetJetTags_probTbc
-    - pfParticleNetJetTags_probTbcq
-    - pfParticleNetJetTags_probTbel
-    - pfParticleNetJetTags_probTbmu
-    - pfParticleNetJetTags_probTbq
-    - pfParticleNetJetTags_probTbqq
-    - pfParticleNetJetTags_probTbta
-    - pfParticleNetJetTags_probWcq
-    - pfParticleNetJetTags_probWqq
-    - pfParticleNetJetTags_probZbb
-    - pfParticleNetJetTags_probZcc
-    - pfParticleNetJetTags_probZqq
-    - pfParticleNetJetTags_probQCDbb
-    - pfParticleNetJetTags_probQCDb
-    - pfParticleNetJetTags_probQCDcc
-    - pfParticleNetJetTags_probQCDc
-    - pfParticleNetJetTags_probQCDothers
+
 
 weights:
     ### [option 1] use precomputed weights stored in the input files
@@ -298,18 +265,18 @@ weights:
     reweight_method: ref
     reweight_hist_ref:
       label_xgg: [
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-      ]
+        [276.786816, 216.713611, 190.371093, 182.685059, 187.994463, 221.442634, 233.055022, 217.373745, 223.119815, 228.408915, 232.858696, 236.882830, 232.887054, 228.245428, 210.658292, 177.299950, 141.932744, 103.907313, 74.026081, 49.955131, 33.398405, 21.144002, 11.948908, 7.204310],
+        [133.631226, 97.404481, 85.555395, 79.284606, 80.450630, 91.853314, 92.545093, 81.215347, 79.822242, 82.046961, 87.508799, 95.550408, 103.753787, 112.129462, 115.562548, 107.761191, 93.603757, 76.003251, 61.741803, 49.787296, 40.637031, 31.904774, 25.093306, 19.125658],
+        [56.580901, 43.511117, 35.073903, 30.514606, 31.463981, 37.259033, 35.609126, 28.991508, 28.782954, 28.785643, 31.113849, 32.948892, 36.692743, 42.849811, 46.679572, 43.871268, 38.400021, 32.933087, 28.300495, 24.557554, 22.290592, 19.887265, 17.377270, 14.989280],
+        [23.843179, 17.928729, 14.290989, 11.706897, 12.324162, 14.104515, 13.173559, 10.755701, 9.742324, 10.711453, 10.845211, 10.689807, 13.097561, 15.492754, 16.400754, 14.428215, 11.717188, 9.803707, 8.032707, 8.569697, 7.811224, 8.019555, 6.816001, 7.097124],
+        [9.205331, 6.551862, 5.254190, 4.545977, 4.140355, 4.679767, 4.411853, 3.677666, 3.499152, 3.603558, 3.603065, 3.605554, 4.225596, 5.259944, 5.696456, 4.553714, 3.236689, 2.504468, 2.325553, 2.296227, 2.191971, 2.043348, 2.178750, 2.073372],
+        [3.339576, 2.515279, 1.857530, 1.681242, 1.294633, 1.575664, 1.407478, 1.156571, 1.188228, 1.047224, 1.097076, 1.129875, 1.070744, 1.761131, 1.879297, 1.273162, 0.907946, 0.650628, 0.701746, 0.530216, 0.591366, 0.572888, 0.578807, 0.467646],
+        [1.005985, 0.739134, 0.695230, 0.492714, 0.485128, 0.438400, 0.421390, 0.330375, 0.240409, 0.341507, 0.329054, 0.242812, 0.354081, 0.391497, 0.539395, 0.351820, 0.189007, 0.222490, 0.298942, 0.187512, 0.176761, 0.106305, 0.101446, 0.117198],
+        [0.319902, 0.247869, 0.116559, 0.114234, 0.099353, 0.161309, 0.073680, 0.117471, 0.081855, 0.097525, 0.052675, 0.078963, 0.066468, 0.099057, 0.143655, 0.098997, 0.044836, 0.081465, 0.027440, 0.030590, 0.063425, 0.034383, 0.050072, 0.025904],
+        [0.100329, 0.044863, 0.030071, 0.024318, 0.027226, 0.029690, 0.028221, 0.017043, 0.012295, 0.025103, 0.014877, 0.055873, 0.041367, 0.018889, 0.020296, 0.007838, 0.033117, 0.003606, 0.004741, 0.002776, 0.008982, 0.009664, 0.004872, 0.006492],
+        [0.059978, 0.036044, 0.004369, 0.002663, 0.006858, 0.005764, 0.002138, 0.005222, 0.001619, 0.002606, 0.006177, 0.001099, 0.005608, 0.005486, 0.001976, 0.000876, 0.000876, 0.005083, 0.000658, 0.000487, 0.000557, 0.001915, 0.000923, 0.000551],
+        [0.007233, 0.002361, 0.001767, 0.003974, 0.000658, 0.000380, 0.000278, 0.000232, 0.000241, 0.000162, 0.000139, 0.000116, 0.000116, 0.003641, 0.000070, 0.000023, 0.000046, 0.000171, 0.000116, 0.000046, 0.000070, 0.000139, 0.000162, 0.000148]
+        ]
     reweight_vars:
         fj_pt: [200, 251, 316, 398, 501, 630, 793, 997, 1255, 1579, 1987, 2500]
         fj_sdmass: [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260]
@@ -324,10 +291,12 @@ weights:
         ]
     class_weights:
       [
-        1,
-        1,
-        1,
-        1
+        770.8,
+        28.06,
+        3.591,
+        0.5491,
+        365.34,
+        1000
       ]
     reweight_hists:
 
