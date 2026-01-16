@@ -1,7 +1,9 @@
+# adapted from https://github.com/hypnotismer/weaver-core-dev/blob/dev-pheno-bbdeltaR/weaver/data_pheno/JetClassII_v2/JetClassII_full_nonscale_manual_deltaR.yaml
+
 selection:
    ### use `&`, `|`, `~` for logical operations on numpy arrays
    ### can use functions from `math`, `np` (numpy), and `awkward` in the expression
-   (jet_pt > 200) & (jet_pt < 2500) & (jet_sdmass > 20) & (jet_sdmass < 500)
+   (jet_pt > 200) & (jet_pt < 2500) & (jet_sdmass > 20) & (jet_sdmass < 500) & (jet_label == 0) & ((np.searchsorted([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], ak.to_numpy(np.hypot((aux_genpart_eta[:, 1] - aux_genpart_eta[:, 2]), ((aux_genpart_phi[:, 1] - aux_genpart_phi[:, 2] + np.pi) % (2 * np.pi) - np.pi)))) == 1) | (np.searchsorted([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], ak.to_numpy(np.hypot((aux_genpart_eta[:, 1] - aux_genpart_eta[:, 2]), ((aux_genpart_phi[:, 1] - aux_genpart_phi[:, 2] + np.pi) % (2 * np.pi) - np.pi)))) == 4) | (np.searchsorted([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], ak.to_numpy(np.hypot((aux_genpart_eta[:, 1] - aux_genpart_eta[:, 2]), ((aux_genpart_phi[:, 1] - aux_genpart_phi[:, 2] + np.pi) % (2 * np.pi) - np.pi)))) == 7) | (np.searchsorted([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], ak.to_numpy(np.hypot((aux_genpart_eta[:, 1] - aux_genpart_eta[:, 2]), ((aux_genpart_phi[:, 1] - aux_genpart_phi[:, 2] + np.pi) % (2 * np.pi) - np.pi)))) == 10))
 
 new_variables:
    ### [format] name: formula
@@ -25,8 +27,10 @@ new_variables:
    part_deltaR: np.hypot(part_deta, part_dphi)
    part_d0: np.tanh(part_d0val)
    part_dz: np.tanh(part_dzval)
-   H_mass: aux_genpart_mass[:,0]
-   H_mass_bin: np.searchsorted([0, 50, 100, 150, 200, 250, 300, 350, 400, 450], ak.to_numpy(H_mass)) - 1
+   bb_deta: aux_genpart_eta[:, 1] - aux_genpart_eta[:, 2]
+   bb_dphi: (aux_genpart_phi[:, 1] - aux_genpart_phi[:, 2] + np.pi) % (2 * np.pi) - np.pi
+   bb_deltaR: np.hypot(bb_deta, bb_dphi)
+   delta_R_bin: np.searchsorted([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], ak.to_numpy(bb_deltaR)) - 1
 
 
 preprocess:
@@ -90,7 +94,7 @@ labels:
    ### [option 2] otherwise use `custom` to define the label, then `value` is a map
    type: custom
    value: 
-      truth_label: H_mass_bin
+      truth_label: delta_R_bin  
 
    ### notes on `jet_label`: 
    ### - ranges from 0-187; 

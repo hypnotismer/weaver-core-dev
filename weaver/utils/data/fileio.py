@@ -264,6 +264,14 @@ def _read_root(filepath, branches, load_range=None, treename=None):
         "'WJetsToLNu_Pt-400To600_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 5000},
         "'WJetsToLNu_Pt-250To400_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 4000},
         "'WJetsToLNu_Pt-100To250_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8' in filepath": {'event_label': 3000},
+        "'WplusH_HToGG_WToLNu_M-125_TuneCP5_13TeV-powheg-pythia8_infer' in filepath": {'event_label': 1000},
+        "'WminusH_HToGG_WToLNu_M-125_TuneCP5_13TeV-powheg-pythia8_infer' in filepath": {'event_label': 1000},
+        "'TTToSemiLeptonic_TuneCP5_13TeV-powheg-pythia8_infer' in filepath": {'event_label': 2000},
+        "'WJetsToLNu_Pt-600ToInf_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 6000},
+        "'WJetsToLNu_Pt-400To600_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 5000},
+        "'WJetsToLNu_Pt-250To400_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 4000},
+        "'WJetsToLNu_Pt-100To250_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 3000},
+        "'BulkGravitonToHHTo4QGluLTau_MX-Var_MH-15to250_LowPt' in filepath": {'event_label': 1000}
     }
     specific_vars_included = {}
     

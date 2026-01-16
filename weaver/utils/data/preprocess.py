@@ -274,8 +274,21 @@ class WeightMaker(object):
                         assert hist_ref.shape == raw_hists[label].shape, \
                             f'Error: shape of reference histogram for class {label} does not match!'
                         ratio = np.nan_to_num(hist_ref / result[label], posinf=0)
-                        upper = np.percentile(ratio[ratio > 0], 100 - self._data_config.reweight_threshold)
+                        
+                        upper = np.percentile(ratio[ratio > 0], 95)
                         wgt = np.clip(ratio / upper, 0, 1)
+                        '''
+                        # 按行进行percentile裁剪，避免整行饱和
+                        wgt = np.zeros_like(result[label], dtype='float32')
+                        for ix in range(ratio.shape[0]):
+                            row = ratio[ix, :]
+                            pos = row > 0
+                            if np.any(pos):
+                                upper_row = np.percentile(row[pos], 100 - self._data_config.reweight_threshold)
+                                wgt[ix, pos] = np.clip(row[pos] / upper_row, 0, 1)
+                            else:
+                                wgt[ix, :] = 0
+                        '''
                         _logger.info('ref method applied to class %s.', label)
                     else:
                         # 未指定的类不做 reweight，使用单位权重

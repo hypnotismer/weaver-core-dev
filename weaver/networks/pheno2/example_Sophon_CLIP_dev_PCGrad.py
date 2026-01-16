@@ -9,6 +9,8 @@ import time
 import os
 from collections import defaultdict, Counter
 
+import random
+from contextlib import nullcontext
 import sklearn.metrics as m
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -23,6 +25,7 @@ from utils.import_tools import import_module
 
 ParT = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT')
 
+import torch.distributed as dist
 
 class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
     """
@@ -51,25 +54,28 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
         else:
             self.cls_blocks_aux = None
 
+        # 若开启双分支，则为两条分支分别注册独立的 cls token 参数（具备不同的名字）
+        if self.dual_cls_blocks:
+            embed_dim = self.cls_token.shape[-1]
+            main_init = self.cls_token[:, 0:1, :].clone().detach()
+            aux_init = self.cls_token[:, 0:1, :].clone().detach()
+            self.cls_token = nn.Parameter(main_init)
+            self.cls_token_aux = nn.Parameter(aux_init)
+
     def _forward_aggregator(self, x, padding_mask):
         # 若未开启双分支，沿用原版逻辑
         if not self.dual_cls_blocks or (self.cls_blocks is None):
             return super()._forward_aggregator(x, padding_mask)
 
-        # 双分支：要求至少有两个 cls tokens（第 1 个用于分类，第 2 个用于对比学习）
+        # 双分支：分别使用独立命名的两个 cls token（主/辅）
         with torch.autocast('cuda', enabled=self.use_amp):
-            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (batch, num_cls_token, embed_dim)
-            if cls_tokens.size(1) < 2:
-                # 不足两个 token 时，退回原版聚合器
-                return super()._forward_aggregator(x, padding_mask)
-
-            # 拆分两条独立分支的起始 cls token
-            cls_token_main = cls_tokens[:, 0:1, :]
-            cls_token_aux = cls_tokens[:, 1:2, :]
+            bsz = x.size(0)
+            cls_token = self.cls_token.expand(bsz, -1, -1)
+            cls_token_aux = self.cls_token_aux.expand(bsz, -1, -1)
 
             # 主分支（用于分类）：使用原有 cls_blocks
             for block in self.cls_blocks:
-                cls_token_main = block(x, x_cls=cls_token_main, padding_mask=padding_mask)
+                cls_token = block(x, x_cls=cls_token, padding_mask=padding_mask)
 
             # 辅分支（用于对比学习）：使用独立的 cls_blocks_aux
             if self.cls_blocks_aux is None:
@@ -78,7 +84,7 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
                 cls_token_aux = block(x, x_cls=cls_token_aux, padding_mask=padding_mask)
 
             # 分别归一化并各自返回 (batch, embed_dim)
-            x_main = self.norm(cls_token_main.squeeze(1))
+            x_main = self.norm(cls_token.squeeze(1))
             x_aux = self.norm(cls_token_aux.squeeze(1))
         return x_main, x_aux
 
@@ -125,18 +131,22 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
             kwargs['fc_params'] = None
             gen_model_kw['fc_params'] = None
 
-            # use a second class token in the main model if share_token is False
-            if self.clip_mode == 'clip-with-cls' and not self.clip_share_token:
+            # 当 dual_cls_blocks 启用时，无视 share_token；不需要通过 num_cls_tokens 提供第二个 token
+            # 若未启用 dual，则仍按旧逻辑：仅在不共享 token 时为主分支提供第二个 cls token
+            if self.clip_mode == 'clip-with-cls' and (not clip_kw.get('dual_cls_blocks', False)) and (not self.clip_share_token):
                 kwargs['num_cls_tokens'] = 2
             if self.clip_mode == 'clip-with-gencls' and not self.clip_share_token:
                 gen_model_kw['num_cls_tokens'] = 2
 
             # initialize model
-            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）
+            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）；启用后忽略 share_token
             if self.clip_mode == 'clip-with-cls' and clip_kw.get('dual_cls_blocks', False):
                 kwargs['dual_cls_blocks'] = True
             self.mod = ParticleTransformer_dual_cls(**kwargs)
             self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
+
+            # 标记 dual 是否启用，便于 forward 中无视 share_token
+            self.dual_cls_blocks = clip_kw.get('dual_cls_blocks', False) if self.clip_mode == 'clip-with-cls' else False
 
             # define outer FCs
             self.mod_proj = FFN(input_dim=kwargs['embed_dims'][-1], output_dim=clip_kw['proj_dim'], fc_params=clip_kw['main_cont_fc_parmas'], bias_last=False)
@@ -213,13 +223,12 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
             # FC (for classifications) and projections (for contrastive loss)
             if self.clip_mode == 'clip-with-cls':
-                if not self.clip_share_token:
-                    # 主模型：分类与对比两路分支
+                # 若启用 dual，则无视 share_token：主分支强制分为分类与对比两路
+                if getattr(self, 'dual_cls_blocks', False):
                     x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
                     logits = self.mod_fc(x_mod_cls)
                     x_mod = self.mod_proj(x_mod_clip)
 
-                    # gen模型：只用于对比分支，若返回双分支，取对比路
                     if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
                         _, x_gen_clip = x_gen_out
                     elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
@@ -228,11 +237,26 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                         x_gen_clip = x_gen_out
                     x_gen = self.gen_proj(x_gen_clip)
                 else:
-                    # 共享一套表征
-                    assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
-                    logits = self.mod_fc(x_mod_out)
-                    x_mod = self.mod_proj(x_mod_out)
-                    x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
+                    if not self.clip_share_token:
+                        # 主模型：分类与对比两路分支
+                        x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
+                        logits = self.mod_fc(x_mod_cls)
+                        x_mod = self.mod_proj(x_mod_clip)
+
+                        # gen模型：只用于对比分支，若返回双分支，取对比路
+                        if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
+                            _, x_gen_clip = x_gen_out
+                        elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
+                            x_gen_clip = x_gen_out[:, 1]
+                        else:
+                            x_gen_clip = x_gen_out
+                        x_gen = self.gen_proj(x_gen_clip)
+                    else:
+                        # 共享一套表征
+                        assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
+                        logits = self.mod_fc(x_mod_out)
+                        x_mod = self.mod_proj(x_mod_out)
+                        x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
 
             elif self.clip_mode == 'clip-with-gencls':
                 if not self.clip_share_token:
@@ -293,11 +317,12 @@ class CLIPLoss(torch.nn.Module):
         Computes the CLIP loss and classification loss
     '''
 
-    def __init__(self, clip_mode=None, beta=1., alpha=1.):
+    def __init__(self, clip_mode=None, beta=1., alpha=1., label_smoothing=0.05):
         super().__init__()
         self.clip_mode = clip_mode
         self.beta = beta
         self.alpha = alpha
+        self.label_smoothing = label_smoothing
         if clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -310,47 +335,26 @@ class CLIPLoss(torch.nn.Module):
         '''
         # compute classification loss
         if logits is not None:
-            loss_cls = F.cross_entropy(logits, labels)
+            loss_cls = F.cross_entropy(logits.float(), labels, label_smoothing=self.label_smoothing)
         else:
             loss_cls = torch.tensor(0., device=labels.device)
 
         # CLIP constrastive learning
         # normalize the features
         if x_mod is not None:
-            x_mod = x_mod / x_mod.norm(dim=-1, keepdim=True)
-            x_gen = x_gen / x_gen.norm(dim=-1, keepdim=True)
+            denom_mod = x_mod.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            denom_gen = x_gen.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            x_mod = x_mod / denom_mod
+            x_gen = x_gen / denom_gen
+            x_mod = torch.nan_to_num(x_mod)
+            x_gen = torch.nan_to_num(x_gen)
 
             # compute cosine similarity
-            logit_scale = self.logit_scale.exp()
-            logits_cont_2d = logit_scale * x_mod @ x_gen.t() # (batch, batch)
-            
-            # 根据 labels >= 161 的条件，创建掩码去除 gen 维度对应的行
-            # 当 labels >= 161 时，对应的样本在 gen 维度上应该被排除
-            mask_gen = labels < 161  # True 表示保留，False 表示排除
-            
-            # 直接删除 mask_gen 为 False 的行和列，改变矩阵大小
-            if not mask_gen.all():  # 如果存在需要排除的样本
-                # 获取需要保留的索引
-                keep_indices = torch.where(mask_gen)[0]
-                
-                # 删除相应的行和列
-                logits_cont_2d = logits_cont_2d[keep_indices][:, keep_indices]  # 同时删除行和列
-                
-                # 更新 indices 以匹配新的矩阵大小
-                indices = torch.arange(len(keep_indices)).to(x_mod.device)
-            else:
-                # 如果没有需要排除的样本，保持原来的 indices
-                indices = torch.arange(x_mod.size(0)).to(x_mod.device)
-            
+            logit_scale = self.logit_scale.exp().clamp(max=100.0)
+            logits_cont_2d = logit_scale * (x_mod.float() @ x_gen.float().t()) # (batch, batch)
+            logits_cont_2d = torch.nan_to_num(logits_cont_2d, neginf=-100.0, posinf=100.0).clamp(min=-100.0, max=100.0)
             logits_cont_2d_t = logits_cont_2d.t()
-
-            try:
-                torch.set_printoptions(profile="full")
-                print(logits_cont_2d)
-                print(logits_cont_2d.shape)
-            finally:
-                torch.set_printoptions(profile="default")
-            breakpoint()
+            indices = torch.arange(x_mod.size(0)).to(x_mod.device) # (batch,)
 
             loss_cont = F.cross_entropy(logits_cont_2d, indices) + F.cross_entropy(logits_cont_2d_t, indices)
         else:
@@ -358,6 +362,143 @@ class CLIPLoss(torch.nn.Module):
 
         loss = self.beta * loss_cls + self.alpha * loss_cont
         return loss, loss_cls, loss_cont
+
+
+class PCGrad:
+    """
+    一个轻量的 PCGrad 包装器，包装任意 PyTorch 优化器，实现梯度冲突手术（Projecting Conflicting Gradients）。
+    用法：
+      - opt = PCGrad(torch.optim.Adam(...))
+      - opt.pc_backward([loss_task1, loss_task2], scaler=grad_scaler)
+      - grad_scaler.step(opt) / opt.step()
+    说明：
+      - 当提供 scaler 时，会在 pc_backward 内部对当前梯度做 unscale_，随后再执行手术与聚合；
+      - pc_backward 会负责零梯度、逐任务回传与聚合后的赋值，外部仅需调用 step 即可。
+    """
+    def __init__(self, optimizer: torch.optim.Optimizer):
+        self._optim = optimizer
+        self.is_pcgrad = True
+
+    @property
+    def param_groups(self):
+        return self._optim.param_groups
+
+    @property
+    def defaults(self):
+        return self._optim.defaults
+
+    def zero_grad(self, set_to_none: bool = False):
+        try:
+            self._optim.zero_grad(set_to_none=set_to_none)
+        except TypeError:
+            # 兼容不支持 set_to_none 的优化器（如 Lookahead）
+            for group in self._optim.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        if set_to_none:
+                            p.grad = None
+                        else:
+                            p.grad.detach_()
+                            p.grad.zero_()
+
+    def step(self, *args, **kwargs):
+        return self._optim.step(*args, **kwargs)
+
+    def _get_trainable_params(self):
+        trainable_params = []
+        for group in self._optim.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    trainable_params.append(p)
+        return trainable_params
+
+    @torch.no_grad()
+    def _project_conflicts_inplace(self, grads_list):
+        """
+        对每个任务的梯度执行两两冲突投影：
+          若 <g_i, g_j> < 0，则 g_i <- g_i - <g_i, g_j> / ||g_j||^2 * g_j
+        grads_list: List[List[Tensor or None]]，外层为任务，内层按参数顺序存储梯度。
+        """
+        num_tasks = len(grads_list)
+        order_indices = list(range(num_tasks))
+        for i in range(num_tasks):
+            random.shuffle(order_indices)
+            for j in order_indices:
+                if j == i:
+                    continue
+                gi_list = grads_list[i]
+                gj_list = grads_list[j]
+                for k in range(len(gi_list)):
+                    gi = gi_list[k]
+                    gj = gj_list[k]
+                    if gi is None or gj is None:
+                        continue
+                    gij = torch.dot(gi.flatten(), gj.flatten())
+                    if gij < 0:
+                        denom = gj.norm().pow(2).clamp_min(1e-12)
+                        gi.add_(gj, alpha=-(gij / denom))
+
+    def pc_backward(self, objectives, scaler: torch.cuda.amp.GradScaler = None, ddp_model=None):
+        """
+        对多个目标（任务）依次回传、收集梯度，进行 PCGrad 手术并聚合到参数的 .grad。
+        - objectives: 可迭代的标量损失张量列表（已按需要乘好权重，比如 beta/alpha）
+        - scaler: 可选 GradScaler；若提供，将使用其 scale/backward/unscale_ 逻辑
+        - ddp_model: 可选 DDP/DP 模型句柄；本实现不再多次 backward，而是用 autograd.grad 抽取梯度，随后手动 all-reduce
+        """
+        # 仅保留需要梯度的目标
+        valid_objectives = [obj for obj in objectives if hasattr(obj, "requires_grad") and obj.requires_grad]
+        if len(valid_objectives) == 0:
+            return
+
+        params = self._get_trainable_params()
+        task_grads = []  # List[List[Tensor or None]]
+        use_ddp = (ddp_model is not None)
+
+        # 使用 autograd.grad 逐任务提取梯度，避免 DDP reducer 在多次 backward 中重复就绪
+        for idx, obj in enumerate(valid_objectives):
+            scaled_obj = scaler.scale(obj) if scaler is not None else obj
+            grads = torch.autograd.grad(
+                outputs=scaled_obj,
+                inputs=params,
+                retain_graph=(idx < len(valid_objectives) - 1),
+                allow_unused=True
+            )
+            grads_this_task = []
+            for g in grads:
+                grads_this_task.append(None if g is None else g.detach().clone())
+            task_grads.append(grads_this_task)
+
+        # 执行冲突投影
+        self._project_conflicts_inplace(task_grads)
+
+        # 聚合并写回到 param.grad
+        self.zero_grad(set_to_none=True)
+        for p_idx, p in enumerate(params):
+            accumulated = None
+            for t in range(len(task_grads)):
+                g = task_grads[t][p_idx]
+                if g is None:
+                    continue
+                accumulated = g if accumulated is None else (accumulated.add_(g))
+            if accumulated is not None:
+                p.grad = accumulated
+
+        # AMP: 若使用 GradScaler，此时 p.grad 仍是 scaled grads，需要先 unscale 再进行分布式聚合
+        if scaler is not None:
+            scaler.unscale_(self)
+
+        # 分布式：显式 all-reduce 聚合后的梯度，保证多卡一致
+        if use_ddp and dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                for p in params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(world_size)
+        # 将非常数梯度中的 NaN/Inf 清零，避免污染权重
+        for p in params:
+            if p.grad is not None:
+                p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def get_model(data_config, **kwargs):
@@ -411,8 +552,6 @@ def get_model(data_config, **kwargs):
         proj_dim=128,
         share_token=False,
         dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
-        enlarge=False,
-        gen_enlarge=True,
         exclude=[],
         main_cont_fc_parmas=[],
         gen_cont_fc_parmas=[],
@@ -433,9 +572,9 @@ def get_model(data_config, **kwargs):
         assert k in cfg, 'Invalid key %s' % k
         cfg[k] = v
     
-    # 仅在 clip-with-cls 且不共享 token 时，启用 dual_cls_blocks（开关位于 clip_kw）
-    if cfg['clip_kw']['mode'] == 'clip-with-cls' and (not cfg['clip_kw']['share_token']):
-        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', True)
+    # 在 clip-with-cls 模式下，dual_cls_blocks 完全由 clip_kw 控制；若未提供则默认 False
+    if cfg['clip_kw']['mode'] == 'clip-with-cls':
+        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', False)
 
     _logger.info('Model config: %s' % str(cfg))
 
@@ -484,6 +623,10 @@ def train_classification_sophon_clip(
         tb_helper=None, extra_args=None):
     model.train()
 
+    # 用 PCGrad 包装优化器（只包装一次）
+    if not hasattr(opt, 'is_pcgrad'):
+        opt = PCGrad(opt)
+
     data_config = train_loader.dataset.config
 
     label_counter = Counter()
@@ -501,16 +644,102 @@ def train_classification_sophon_clip(
             label = y[data_config.label_names[0]].long().to(dev) # label is obtained from inputs
             entry_count += label.shape[0]
             opt.zero_grad()
-            with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
-                logits, x_mod, x_gen = model(*inputs)
-                loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
-            if grad_scaler is None:
-                loss.backward()
-                opt.step()
+            # 判断当前模式是否包含分类或对比任务
+            clip_mode = getattr(model.module, 'clip_mode', None) if hasattr(model, 'module') else getattr(model, 'clip_mode', None)
+            has_cls_task = clip_mode in ['clip-with-cls', 'cls-only', 'clip-finetune']
+            has_cont_task = clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']
+
+            # 当使用 PCGrad 时，分别做独立前向以避免 DDP 同图多次反传
+            if hasattr(opt, 'is_pcgrad') and opt.is_pcgrad:
+                objectives = []
+                loss_cls = torch.tensor(0., device=label.device)
+                loss_cont = torch.tensor(0., device=label.device)
+
+                if has_cls_task:
+                    with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                        logits, _, _ = model(*inputs)
+                        loss_cls = F.cross_entropy(logits, label)
+                    objectives.append(loss_func.beta * loss_cls)
+
+                if has_cont_task:
+                    with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                        _, x_mod, x_gen = model(*inputs)
+                        # 仅计算对比损失分量
+                        _, _, loss_cont = loss_func(None, x_mod, x_gen, label)
+                    objectives.append(loss_func.alpha * loss_cont)
+
+                # 过滤非有限的目标，避免 NaN 传播
+                objectives = [obj for obj in objectives if torch.isfinite(obj)]
+                if len(objectives) > 0:
+                    if grad_scaler is None:
+                        opt.pc_backward(objectives, scaler=None, ddp_model=model)
+                        # 梯度裁剪（提高稳定性）
+                        try:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        except Exception:
+                            pass
+                        opt.step()
+                        # 约束温度参数范围，避免对比 logits 失控
+                        try:
+                            if hasattr(loss_func, 'logit_scale'):
+                                with torch.no_grad():
+                                    loss_func.logit_scale.data.clamp_(min=np.log(1/100.0), max=np.log(100.0))
+                        except Exception:
+                            pass
+                    else:
+                        opt.pc_backward(objectives, scaler=grad_scaler, ddp_model=model)
+                        # AMP 下：已在 pc_backward 内执行 unscale_，可进行裁剪
+                        try:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        except Exception:
+                            pass
+                        grad_scaler.step(opt)
+                        grad_scaler.update()
+                        # 约束温度参数范围
+                        try:
+                            if hasattr(loss_func, 'logit_scale'):
+                                with torch.no_grad():
+                                    loss_func.logit_scale.data.clamp_(min=np.log(1/100.0), max=np.log(100.0))
+                        except Exception:
+                            pass
+
+                # 汇总本次 loss（用于日志，不用于反向）
+                loss = (loss_func.beta * loss_cls + loss_func.alpha * loss_cont).detach()
             else:
-                grad_scaler.scale(loss).backward()
-                grad_scaler.step(opt)
-                grad_scaler.update()
+                # 非 PCGrad 路径：一次前向一次反向
+                with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                    logits, x_mod, x_gen = model(*inputs)
+                    loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+                    # 检查非有限 loss，避免更新
+                    if not torch.isfinite(loss):
+                        _logger.info('Skip step due to non-finite loss (loss=%.3e, cls=%.3e, cont=%.3e)' % (loss, loss_cls, loss_cont))
+                        opt.zero_grad()
+                    else:
+                        if grad_scaler is None:
+                            loss.backward()
+                            # 裁剪
+                            try:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            except Exception:
+                                pass
+                            opt.step()
+                        else:
+                            grad_scaler.scale(loss).backward()
+                            # 先 unscale 再裁剪
+                            try:
+                                grad_scaler.unscale_(opt)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            except Exception:
+                                pass
+                            grad_scaler.step(opt)
+                            grad_scaler.update()
+                    # 约束温度参数范围
+                    try:
+                        if hasattr(loss_func, 'logit_scale'):
+                            with torch.no_grad():
+                                loss_func.logit_scale.data.clamp_(min=np.log(1/100.0), max=np.log(100.0))
+                    except Exception:
+                        pass
 
             if scheduler and getattr(scheduler, '_update_per_step', False):
                 scheduler.step()

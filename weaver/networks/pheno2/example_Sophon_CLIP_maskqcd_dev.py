@@ -327,30 +327,24 @@ class CLIPLoss(torch.nn.Module):
             # 根据 labels >= 161 的条件，创建掩码去除 gen 维度对应的行
             # 当 labels >= 161 时，对应的样本在 gen 维度上应该被排除
             mask_gen = labels < 161  # True 表示保留，False 表示排除
+            if not mask_gen.all():  # 如果有需要排除的样本
+                # 创建掩码矩阵，排除 labels >= 161 对应的行
+                mask_matrix = mask_gen.unsqueeze(0).expand(logits_cont_2d.size(0), -1)  # (batch, batch)
+                logits_cont_2d = logits_cont_2d.masked_fill(~mask_matrix, 1e-4)
+                # 将需要排除的样本对应行的对角元替换为 14
+                exclude_idx = (~mask_gen).nonzero(as_tuple=False).squeeze(1)
+                if exclude_idx.numel() > 0:
+                    logits_cont_2d[exclude_idx, exclude_idx] = 14.28
             
-            # 直接删除 mask_gen 为 False 的行和列，改变矩阵大小
-            if not mask_gen.all():  # 如果存在需要排除的样本
-                # 获取需要保留的索引
-                keep_indices = torch.where(mask_gen)[0]
-                
-                # 删除相应的行和列
-                logits_cont_2d = logits_cont_2d[keep_indices][:, keep_indices]  # 同时删除行和列
-                
-                # 更新 indices 以匹配新的矩阵大小
-                indices = torch.arange(len(keep_indices)).to(x_mod.device)
-            else:
-                # 如果没有需要排除的样本，保持原来的 indices
-                indices = torch.arange(x_mod.size(0)).to(x_mod.device)
-            
+            #try:
+                #torch.set_printoptions(profile="full")
+                #print(logits_cont_2d)
+                #print(exclude_idx)
+            #finally:
+                #torch.set_printoptions(profile="default")
+            #breakpoint()
             logits_cont_2d_t = logits_cont_2d.t()
-
-            try:
-                torch.set_printoptions(profile="full")
-                print(logits_cont_2d)
-                print(logits_cont_2d.shape)
-            finally:
-                torch.set_printoptions(profile="default")
-            breakpoint()
+            indices = torch.arange(x_mod.size(0)).to(x_mod.device) # (batch,)
 
             loss_cont = F.cross_entropy(logits_cont_2d, indices) + F.cross_entropy(logits_cont_2d_t, indices)
         else:

@@ -95,7 +95,7 @@ def to_cos_sin_angles(xi, xj, normed_inputs=False, eps=1e-8):
     else:
         ni, nj = p3_norm(xi, eps), p3_norm(xj, eps)
     cos = (ni * nj).sum(dim=1, keepdim=True).clamp(min=-1, max=1)
-    sin = torch.linalg.cross(ni, nj, dim=1).norm(dim=1, keepdim=True).clamp(min=0, max=1)
+    sin = torch.cross(ni, nj, dim=1).norm(dim=1, keepdim=True).clamp(min=0, max=1)
     return cos, sin
 
 
@@ -553,7 +553,15 @@ class Attention(torch.nn.Module):
                 attn_mask = attn_mask + key_padding_mask
 
         # (bsz, seq_len, num_heads*head_dim)
-        q, k, v = F._in_projection_packed(query, key, value, self.in_proj.weight, self.in_proj.bias)
+        # Replace private _in_projection_packed with explicit linear projections for ONNX opset 11 compatibility
+        w_q, w_k, w_v = self.in_proj.weight.split(self.embed_dim, dim=0)
+        if self.in_proj.bias is not None:
+            b_q, b_k, b_v = self.in_proj.bias.split(self.embed_dim, dim=0)
+        else:
+            b_q = b_k = b_v = None
+        q = F.linear(query, w_q, b_q)
+        k = F.linear(key, w_k, b_k)
+        v = F.linear(value, w_v, b_v)
 
         # -> (bsz, num_heads, src/tgt_len, head_dim)
         q = q.view(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -562,7 +570,14 @@ class Attention(torch.nn.Module):
 
         dropout_p = self.dropout if self.training else 0.
 
-        if self.use_sdpa:
+        # Disable SDPA during ONNX export (opset 11 lacks a native op). Use matmul+softmax instead.
+        use_sdpa = self.use_sdpa
+        try:
+            if hasattr(torch, 'onnx') and torch.onnx.is_in_onnx_export():
+                use_sdpa = False
+        except Exception:
+            pass
+        if use_sdpa:
             # attn_output: (bsz, num_heads, tgt_len, head_dim)
             attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p)
         else:
@@ -705,7 +720,12 @@ class Block(nn.Module):
         if self.c_attn is not None:
             bsz, tgt_len, _ = x.size()
             x = x.view(bsz, tgt_len, self.num_heads, self.head_dim)
-            x = torch.einsum('bthd,h->btdh', x, self.c_attn)
+            # Replace einsum('bthd,h->btdh', x, self.c_attn) with broadcast multiply + permute for ONNX opset 11
+            c = self.c_attn
+            if c.dtype != x.dtype:
+                c = c.to(dtype=x.dtype)
+            x = x * c.view(1, 1, self.num_heads, 1)
+            x = x.permute(0, 1, 3, 2).contiguous()
             x = x.reshape(bsz, tgt_len, self.embed_dim)
         x = self.post_attn_norm(x)
         x = self.dropout(x)

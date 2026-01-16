@@ -1,7 +1,7 @@
 selection:
    ### use `&`, `|`, `~` for logical operations on numpy arrays
    ### can use functions from `math`, `np` (numpy), and `awkward` in the expression
-   (jet_pt > 200) & (jet_pt < 2500) & (jet_sdmass > 20) & (jet_sdmass < 500)
+   (jet_pt > 200) & (jet_pt < 2500) & (jet_sdmass > 20) & (jet_sdmass < 500) & ((np.searchsorted([0, 50, 100, 150, 200, 250, 300, 350, 400, 450], ak.to_numpy(aux_genpart_mass[:,0])) == 1) | (np.searchsorted([0, 50, 100, 150, 200, 250, 300, 350, 400, 450], ak.to_numpy(aux_genpart_mass[:,0])) == 4) | (np.searchsorted([0, 50, 100, 150, 200, 250, 300, 350, 400, 450], ak.to_numpy(aux_genpart_mass[:,0])) == 7) | (np.searchsorted([0, 50, 100, 150, 200, 250, 300, 350, 400, 450], ak.to_numpy(aux_genpart_mass[:,0])) == 10))
 
 new_variables:
    ### [format] name: formula

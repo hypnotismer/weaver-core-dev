@@ -684,25 +684,8 @@ labels:
 observers:
 - event_no
 - fj_label
-- fj_pt
-- fj_eta
-- fj_phi
-- fj_mass
-- fj_sdmass
-- fj_sdmass_fromsubjets
-- fj_gen_mass
-- fj_genparts_mass
-- fj_genjet_sdmass
-- fj_genjet_nomu_sdmass
-- sample_isQCD
-- pfMassDecorrelatedParticleNetJetTags_probXbb
-- pfMassDecorrelatedParticleNetJetTags_probXcc
-- pfMassDecorrelatedParticleNetJetTags_probXqq
-- pfMassDecorrelatedParticleNetJetTags_probQCDb
-- pfMassDecorrelatedParticleNetJetTags_probQCDbb
-- pfMassDecorrelatedParticleNetJetTags_probQCDc
-- pfMassDecorrelatedParticleNetJetTags_probQCDcc
-- pfMassDecorrelatedParticleNetJetTags_probQCDothers
+
+
 monitor_variables: []
 weights:
   use_precomputed_weights: false

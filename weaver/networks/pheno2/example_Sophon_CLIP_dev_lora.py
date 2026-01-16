@@ -3,6 +3,7 @@ import awkward as ak
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 import copy
 import tqdm
 import time
@@ -13,6 +14,7 @@ import sklearn.metrics as m
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 mpl.use('Agg')
+import re
 
 from utils.logger import _logger
 from utils.nn.tools import (
@@ -22,6 +24,74 @@ from utils.nn.tools import (
 from utils.import_tools import import_module
 
 ParT = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT')
+
+
+class LoRALinear(nn.Module):
+    """
+    将 nn.Linear 替换为线性层 + LoRA 低秩适配分支：
+      y = x @ W^T + scale * (x @ A^T) @ B^T + bias
+    其中 scale = alpha / r。
+    """
+    def __init__(self, in_features, out_features, r=8, alpha=16, dropout=0.0, bias=True, train_base=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = int(r)
+        self.scaling = float(alpha) / float(max(1, r))
+        self.train_base = bool(train_base)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+        # LoRA 分支
+        if self.r > 0:
+            self.lora_A = nn.Parameter(torch.empty(self.r, in_features))
+            self.lora_B = nn.Parameter(torch.empty(out_features, self.r))
+            self.lora_dropout = nn.Dropout(p=dropout) if dropout and dropout > 0 else nn.Identity()
+        else:
+            # 关闭 LoRA 时，仅为兼容性保留属性
+            self.register_parameter('lora_A', None)
+            self.register_parameter('lora_B', None)
+            self.lora_dropout = nn.Identity()
+        self.reset_parameters()
+        # 冻结/解冻基座权重
+        self.weight.requires_grad = self.train_base
+        if self.bias is not None:
+            self.bias.requires_grad = self.train_base
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, r=8, alpha=16, dropout=0.0, train_base=False):
+        mod = cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            r=r,
+            alpha=alpha,
+            dropout=dropout,
+            bias=linear.bias is not None,
+            train_base=train_base,
+        )
+        with torch.no_grad():
+            mod.weight.copy_(linear.weight)
+            if linear.bias is not None:
+                mod.bias.copy_(linear.bias)
+            if mod.r > 0:
+                # LoRA 初始化：B=0，A=Kaiming
+                nn.init.kaiming_uniform_(mod.lora_A, a=math.sqrt(5))
+                nn.init.zeros_(mod.lora_B)
+        return mod
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_features
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.linear(x, self.weight, self.bias)
+        if self.r > 0 and self.lora_A is not None and self.lora_B is not None:
+            x_d = self.lora_dropout(x)
+            lora_update = F.linear(F.linear(x_d, self.lora_A, None), self.lora_B, None)
+            y = y + self.scaling * lora_update
+        return y
 
 
 class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
@@ -51,25 +121,28 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
         else:
             self.cls_blocks_aux = None
 
+        # 若开启双分支，则为两条分支分别注册独立的 cls token 参数（具备不同的名字）
+        if self.dual_cls_blocks:
+            embed_dim = self.cls_token.shape[-1]
+            main_init = self.cls_token[:, 0:1, :].clone().detach()
+            aux_init = self.cls_token[:, 0:1, :].clone().detach()
+            self.cls_token = nn.Parameter(main_init)
+            self.cls_token_aux = nn.Parameter(aux_init)
+
     def _forward_aggregator(self, x, padding_mask):
         # 若未开启双分支，沿用原版逻辑
         if not self.dual_cls_blocks or (self.cls_blocks is None):
             return super()._forward_aggregator(x, padding_mask)
 
-        # 双分支：要求至少有两个 cls tokens（第 1 个用于分类，第 2 个用于对比学习）
+        # 双分支：分别使用独立命名的两个 cls token（主/辅）
         with torch.autocast('cuda', enabled=self.use_amp):
-            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (batch, num_cls_token, embed_dim)
-            if cls_tokens.size(1) < 2:
-                # 不足两个 token 时，退回原版聚合器
-                return super()._forward_aggregator(x, padding_mask)
-
-            # 拆分两条独立分支的起始 cls token
-            cls_token_main = cls_tokens[:, 0:1, :]
-            cls_token_aux = cls_tokens[:, 1:2, :]
+            bsz = x.size(0)
+            cls_token = self.cls_token.expand(bsz, -1, -1)
+            cls_token_aux = self.cls_token_aux.expand(bsz, -1, -1)
 
             # 主分支（用于分类）：使用原有 cls_blocks
             for block in self.cls_blocks:
-                cls_token_main = block(x, x_cls=cls_token_main, padding_mask=padding_mask)
+                cls_token = block(x, x_cls=cls_token, padding_mask=padding_mask)
 
             # 辅分支（用于对比学习）：使用独立的 cls_blocks_aux
             if self.cls_blocks_aux is None:
@@ -78,7 +151,7 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
                 cls_token_aux = block(x, x_cls=cls_token_aux, padding_mask=padding_mask)
 
             # 分别归一化并各自返回 (batch, embed_dim)
-            x_main = self.norm(cls_token_main.squeeze(1))
+            x_main = self.norm(cls_token.squeeze(1))
             x_aux = self.norm(cls_token_aux.squeeze(1))
         return x_main, x_aux
 
@@ -113,6 +186,7 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
         super().__init__()
         gen_model_kw = kwargs.pop('gen_model_kw')
         clip_kw = kwargs.pop('clip_kw')
+        lora_kw = kwargs.pop('lora_kw', dict())
         self.clip_mode = clip_kw['mode']
         self.clip_share_token = clip_kw['share_token']
 
@@ -125,18 +199,22 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
             kwargs['fc_params'] = None
             gen_model_kw['fc_params'] = None
 
-            # use a second class token in the main model if share_token is False
-            if self.clip_mode == 'clip-with-cls' and not self.clip_share_token:
+            # 当 dual_cls_blocks 启用时，无视 share_token；不需要通过 num_cls_tokens 提供第二个 token
+            # 若未启用 dual，则仍按旧逻辑：仅在不共享 token 时为主分支提供第二个 cls token
+            if self.clip_mode == 'clip-with-cls' and (not clip_kw.get('dual_cls_blocks', False)) and (not self.clip_share_token):
                 kwargs['num_cls_tokens'] = 2
             if self.clip_mode == 'clip-with-gencls' and not self.clip_share_token:
                 gen_model_kw['num_cls_tokens'] = 2
 
             # initialize model
-            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）
+            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）；启用后忽略 share_token
             if self.clip_mode == 'clip-with-cls' and clip_kw.get('dual_cls_blocks', False):
                 kwargs['dual_cls_blocks'] = True
             self.mod = ParticleTransformer_dual_cls(**kwargs)
             self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
+
+            # 标记 dual 是否启用，便于 forward 中无视 share_token
+            self.dual_cls_blocks = clip_kw.get('dual_cls_blocks', False) if self.clip_mode == 'clip-with-cls' else False
 
             # define outer FCs
             self.mod_proj = FFN(input_dim=kwargs['embed_dims'][-1], output_dim=clip_kw['proj_dim'], fc_params=clip_kw['main_cont_fc_parmas'], bias_last=False)
@@ -173,6 +251,64 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
         elif self.clip_mode in ['gencls-only']:
             self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
+
+        # LoRA 注入（可选）
+        if lora_kw.get('enable', False):
+            self._inject_lora(self.mod if 'mod' in lora_kw.get('apply_to', ['mod']) else None, lora_kw, name_prefix='mod')
+            if hasattr(self, 'gen') and ('gen' in lora_kw.get('apply_to', [])):
+                self._inject_lora(self.gen, lora_kw, name_prefix='gen')
+            # 冻结非 LoRA 参数（默认开启）
+            if lora_kw.get('freeze_non_lora', True):
+                for n, p in self.named_parameters():
+                    if ('lora_A' in n) or ('lora_B' in n):
+                        p.requires_grad = True
+                    else:
+                        # 若显式允许训练分类头
+                        if lora_kw.get('train_classifier', False) and (n.startswith('mod_fc') or n.startswith('gen_fc')):
+                            continue
+                        # 允许白名单强制训练（支持子串或正则匹配）
+                        train_whitelist = lora_kw.get('train_whitelist', [])
+                        keep_train = False
+                        for pat in train_whitelist:
+                            try:
+                                if re.search(pat, n):
+                                    keep_train = True
+                                    break
+                            except re.error:
+                                if pat in n:
+                                    keep_train = True
+                                    break
+                        if keep_train:
+                            p.requires_grad = True
+                        else:
+                            p.requires_grad = False
+
+    def _inject_lora(self, root: nn.Module, lora_kw: dict, name_prefix: str = ''):
+        if root is None:
+            return
+        targets = set(lora_kw.get('target_modules', ['q_proj', 'k_proj', 'v_proj', 'out_proj', 'fc1', 'fc2']))
+        excludes = list(lora_kw.get('exclude_from_lora', []))
+        r = int(lora_kw.get('r', 8))
+        alpha = float(lora_kw.get('alpha', 16))
+        dropout = float(lora_kw.get('dropout', 0.0))
+        train_base = bool(lora_kw.get('train_base', False))
+
+        def match(path: str) -> bool:
+            if any(ex in path for ex in excludes):
+                return False
+            return any(t in path for t in targets)
+
+        def replace_recursively(module: nn.Module, prefix: str = ''):
+            for child_name, child in list(module.named_children()):
+                full_name = prefix + ('.' if prefix else '') + child_name
+                if isinstance(child, nn.Linear) and match(full_name):
+                    new_layer = LoRALinear.from_linear(child, r=r, alpha=alpha, dropout=dropout, train_base=train_base)
+                    setattr(module, child_name, new_layer)
+                    _logger.info('LoRA injected at %s.%s', name_prefix, full_name)
+                else:
+                    replace_recursively(child, full_name)
+
+        replace_recursively(root, '')
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -213,13 +349,12 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
             # FC (for classifications) and projections (for contrastive loss)
             if self.clip_mode == 'clip-with-cls':
-                if not self.clip_share_token:
-                    # 主模型：分类与对比两路分支
+                # 若启用 dual，则无视 share_token：主分支强制分为分类与对比两路
+                if getattr(self, 'dual_cls_blocks', False):
                     x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
                     logits = self.mod_fc(x_mod_cls)
                     x_mod = self.mod_proj(x_mod_clip)
 
-                    # gen模型：只用于对比分支，若返回双分支，取对比路
                     if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
                         _, x_gen_clip = x_gen_out
                     elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
@@ -228,11 +363,26 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                         x_gen_clip = x_gen_out
                     x_gen = self.gen_proj(x_gen_clip)
                 else:
-                    # 共享一套表征
-                    assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
-                    logits = self.mod_fc(x_mod_out)
-                    x_mod = self.mod_proj(x_mod_out)
-                    x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
+                    if not self.clip_share_token:
+                        # 主模型：分类与对比两路分支
+                        x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
+                        logits = self.mod_fc(x_mod_cls)
+                        x_mod = self.mod_proj(x_mod_clip)
+
+                        # gen模型：只用于对比分支，若返回双分支，取对比路
+                        if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
+                            _, x_gen_clip = x_gen_out
+                        elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
+                            x_gen_clip = x_gen_out[:, 1]
+                        else:
+                            x_gen_clip = x_gen_out
+                        x_gen = self.gen_proj(x_gen_clip)
+                    else:
+                        # 共享一套表征
+                        assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
+                        logits = self.mod_fc(x_mod_out)
+                        x_mod = self.mod_proj(x_mod_out)
+                        x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
 
             elif self.clip_mode == 'clip-with-gencls':
                 if not self.clip_share_token:
@@ -323,34 +473,8 @@ class CLIPLoss(torch.nn.Module):
             # compute cosine similarity
             logit_scale = self.logit_scale.exp()
             logits_cont_2d = logit_scale * x_mod @ x_gen.t() # (batch, batch)
-            
-            # 根据 labels >= 161 的条件，创建掩码去除 gen 维度对应的行
-            # 当 labels >= 161 时，对应的样本在 gen 维度上应该被排除
-            mask_gen = labels < 161  # True 表示保留，False 表示排除
-            
-            # 直接删除 mask_gen 为 False 的行和列，改变矩阵大小
-            if not mask_gen.all():  # 如果存在需要排除的样本
-                # 获取需要保留的索引
-                keep_indices = torch.where(mask_gen)[0]
-                
-                # 删除相应的行和列
-                logits_cont_2d = logits_cont_2d[keep_indices][:, keep_indices]  # 同时删除行和列
-                
-                # 更新 indices 以匹配新的矩阵大小
-                indices = torch.arange(len(keep_indices)).to(x_mod.device)
-            else:
-                # 如果没有需要排除的样本，保持原来的 indices
-                indices = torch.arange(x_mod.size(0)).to(x_mod.device)
-            
             logits_cont_2d_t = logits_cont_2d.t()
-
-            try:
-                torch.set_printoptions(profile="full")
-                print(logits_cont_2d)
-                print(logits_cont_2d.shape)
-            finally:
-                torch.set_printoptions(profile="default")
-            breakpoint()
+            indices = torch.arange(x_mod.size(0)).to(x_mod.device) # (batch,)
 
             loss_cont = F.cross_entropy(logits_cont_2d, indices) + F.cross_entropy(logits_cont_2d_t, indices)
         else:
@@ -385,7 +509,9 @@ def get_model(data_config, **kwargs):
         # gen model kwargs
         gen_model_kw=dict(),
         # clip kwargs
-        clip_kw=dict()
+        clip_kw=dict(),
+        # lora kwargs
+        lora_kw=dict()
     )
     cfg['gen_model_kw'].update(
         input_dim=len(data_config.input_dicts.get('gen_features', [])),
@@ -411,8 +537,6 @@ def get_model(data_config, **kwargs):
         proj_dim=128,
         share_token=False,
         dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
-        enlarge=False,
-        gen_enlarge=True,
         exclude=[],
         main_cont_fc_parmas=[],
         gen_cont_fc_parmas=[],
@@ -420,6 +544,19 @@ def get_model(data_config, **kwargs):
         init_opts=dict(),
         beta=1., # loss weight for cls loss
         alpha=1., # loss weight for contrastive loss
+    )
+    cfg['lora_kw'].update(
+        enable=False,
+        r=8,
+        alpha=16,
+        dropout=0.0,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'out_proj', 'fc1', 'fc2'],
+        apply_to=['mod'],  # 'mod' or 'gen' or both
+        freeze_non_lora=True,
+        train_base=False,
+        train_classifier=False,
+        exclude_from_lora=[],
+        train_whitelist=[],
     )
 
     # update configurations
@@ -429,13 +566,16 @@ def get_model(data_config, **kwargs):
     for k, v in kwargs.pop('clip_kw', dict()).items():
         assert k in cfg['clip_kw'], 'Invalid key %s in "clip_kw"' % k
         cfg['clip_kw'][k] = v
+    for k, v in kwargs.pop('lora_kw', dict()).items():
+        assert k in cfg['lora_kw'], 'Invalid key %s in "lora_kw"' % k
+        cfg['lora_kw'][k] = v
     for k, v in kwargs.items():
         assert k in cfg, 'Invalid key %s' % k
         cfg[k] = v
     
-    # 仅在 clip-with-cls 且不共享 token 时，启用 dual_cls_blocks（开关位于 clip_kw）
-    if cfg['clip_kw']['mode'] == 'clip-with-cls' and (not cfg['clip_kw']['share_token']):
-        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', True)
+    # 在 clip-with-cls 模式下，dual_cls_blocks 完全由 clip_kw 控制；若未提供则默认 False
+    if cfg['clip_kw']['mode'] == 'clip-with-cls':
+        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', False)
 
     _logger.info('Model config: %s' % str(cfg))
 

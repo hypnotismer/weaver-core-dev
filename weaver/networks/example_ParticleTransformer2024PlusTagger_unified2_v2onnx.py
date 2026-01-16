@@ -21,7 +21,7 @@ from utils.nn.tools import (
 )
 from utils.import_tools import import_module
 
-ParticleTransformerTagger_ncoll = import_module(os.path.join(os.path.dirname(__file__), 'ParticleTransformer2024Plus.py'), 'ParT').ParticleTransformerTagger_ncoll
+ParticleTransformerTagger_ncoll = import_module(os.path.join(os.path.dirname(__file__), 'ParticleTransformer2024Plus_v2onnx.py'), 'ParT').ParticleTransformerTagger_ncoll
 
 
 class ParticleTransformerTaggerForFinetune(nn.Module):
@@ -57,13 +57,6 @@ class ParticleTransformerTaggerForFinetune(nn.Module):
 
         self.num_ft_nodes = finetune_kw.get('num_ft_nodes')
         self.freeze_main_params = finetune_kw.get('freeze_main_params', True)
-
-        # If requested, fully freeze the main model parameters so DDP does not
-        # expect gradients for them. This avoids "unused parameter" issues when
-        # fine-tuning with external heads that bypass parts of the main network.
-        if self.freeze_main_params:
-            for p in self.main.parameters():
-                p.requires_grad = False
 
         fc_params = finetune_kw.get('fc_params')
         self.fc_suff_kw = finetune_kw.get('fc_suff_kw', None)
@@ -156,21 +149,6 @@ class ParticleTransformerTaggerForFinetune(nn.Module):
         if self.for_inference:
             if self.mode == 'cls':
                 output = torch.softmax(output, dim=1)
-        
-        # Ensure all trainable parameters participate in the autograd graph on every forward.
-        # This avoids DistributedDataParallel error: "Expected to have finished reduction..."
-        # which can happen when some parameters (e.g. heads not used under certain fine-tuning
-        # configurations) do not receive gradients in a particular iteration.
-        # By adding a zero-valued dependency on every trainable parameter, we keep numerical
-        # outputs unchanged while guaranteeing graph connectivity for DDP.
-        if self.training and torch.is_grad_enabled():
-            with torch.autocast('cuda', enabled=self.main.use_amp):
-                zero = torch.zeros((), device=output.device, dtype=output.dtype)
-                for p in self.parameters():
-                    if p.requires_grad:
-                        # zero-valued dependency; does not change output but keeps params in graph
-                        zero = zero + (p.view(-1)[0] * 0.0)
-                output = output + zero
         return output
 
 
@@ -834,6 +812,9 @@ def save_hybrid(args, data_config, scores, labels, observers):
 
     output = {}
     scores_cls, scores_reg = scores
+
+    print('scores_cls.shape:', scores_cls.shape[1])
+    breakpoint()
     assert scores_cls.shape[1] == len(label_cls_nodes), 'Number of classification nodes does not match'
 
     # write regression nodes

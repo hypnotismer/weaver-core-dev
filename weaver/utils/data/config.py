@@ -259,8 +259,12 @@ class DataConfig(object):
                     if var_name.startswith(s):
                         j[k]['min_length'] = min_len
                         break
+                #if j[k]['min_length'] is None:
+                    #raise ValueError('unknown var_name: %s' % var_name)
                 if j[k]['min_length'] is None:
-                    raise ValueError('unknown var_name: %s' % var_name)
+                        # Fallback for non-sequence or scalar-like features (e.g. fj_*, jet-level features)
+                        # Default to 1 to allow ONNX preprocessing export to proceed.
+                    j[k]['min_length'] = 1
                 info = self.preprocess_params[var_name]
                 j[k]['var_infos'][var_name] = {
                     'median': 0 if info['center'] is None else info['center'],

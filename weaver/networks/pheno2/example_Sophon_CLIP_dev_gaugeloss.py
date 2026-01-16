@@ -7,6 +7,7 @@ import copy
 import tqdm
 import time
 import os
+import re
 from collections import defaultdict, Counter
 
 import sklearn.metrics as m
@@ -51,25 +52,28 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
         else:
             self.cls_blocks_aux = None
 
+        # 若开启双分支，则为两条分支分别注册独立的 cls token 参数（具备不同的名字）
+        if self.dual_cls_blocks:
+            embed_dim = self.cls_token.shape[-1]
+            main_init = self.cls_token[:, 0:1, :].clone().detach()
+            aux_init = self.cls_token[:, 0:1, :].clone().detach()
+            self.cls_token = nn.Parameter(main_init)
+            self.cls_token_aux = nn.Parameter(aux_init)
+
     def _forward_aggregator(self, x, padding_mask):
         # 若未开启双分支，沿用原版逻辑
         if not self.dual_cls_blocks or (self.cls_blocks is None):
             return super()._forward_aggregator(x, padding_mask)
 
-        # 双分支：要求至少有两个 cls tokens（第 1 个用于分类，第 2 个用于对比学习）
+        # 双分支：分别使用独立命名的两个 cls token（主/辅）
         with torch.autocast('cuda', enabled=self.use_amp):
-            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (batch, num_cls_token, embed_dim)
-            if cls_tokens.size(1) < 2:
-                # 不足两个 token 时，退回原版聚合器
-                return super()._forward_aggregator(x, padding_mask)
-
-            # 拆分两条独立分支的起始 cls token
-            cls_token_main = cls_tokens[:, 0:1, :]
-            cls_token_aux = cls_tokens[:, 1:2, :]
+            bsz = x.size(0)
+            cls_token = self.cls_token.expand(bsz, -1, -1)
+            cls_token_aux = self.cls_token_aux.expand(bsz, -1, -1)
 
             # 主分支（用于分类）：使用原有 cls_blocks
             for block in self.cls_blocks:
-                cls_token_main = block(x, x_cls=cls_token_main, padding_mask=padding_mask)
+                cls_token = block(x, x_cls=cls_token, padding_mask=padding_mask)
 
             # 辅分支（用于对比学习）：使用独立的 cls_blocks_aux
             if self.cls_blocks_aux is None:
@@ -78,7 +82,7 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
                 cls_token_aux = block(x, x_cls=cls_token_aux, padding_mask=padding_mask)
 
             # 分别归一化并各自返回 (batch, embed_dim)
-            x_main = self.norm(cls_token_main.squeeze(1))
+            x_main = self.norm(cls_token.squeeze(1))
             x_aux = self.norm(cls_token_aux.squeeze(1))
         return x_main, x_aux
 
@@ -125,18 +129,22 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
             kwargs['fc_params'] = None
             gen_model_kw['fc_params'] = None
 
-            # use a second class token in the main model if share_token is False
-            if self.clip_mode == 'clip-with-cls' and not self.clip_share_token:
+            # 当 dual_cls_blocks 启用时，无视 share_token；不需要通过 num_cls_tokens 提供第二个 token
+            # 若未启用 dual，则仍按旧逻辑：仅在不共享 token 时为主分支提供第二个 cls token
+            if self.clip_mode == 'clip-with-cls' and (not clip_kw.get('dual_cls_blocks', False)) and (not self.clip_share_token):
                 kwargs['num_cls_tokens'] = 2
             if self.clip_mode == 'clip-with-gencls' and not self.clip_share_token:
                 gen_model_kw['num_cls_tokens'] = 2
 
             # initialize model
-            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）
+            # 仅在 clip-with-cls 模式下支持 dual_cls_blocks（来自 clip_kw 配置）；启用后忽略 share_token
             if self.clip_mode == 'clip-with-cls' and clip_kw.get('dual_cls_blocks', False):
                 kwargs['dual_cls_blocks'] = True
             self.mod = ParticleTransformer_dual_cls(**kwargs)
             self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
+
+            # 标记 dual 是否启用，便于 forward 中无视 share_token
+            self.dual_cls_blocks = clip_kw.get('dual_cls_blocks', False) if self.clip_mode == 'clip-with-cls' else False
 
             # define outer FCs
             self.mod_proj = FFN(input_dim=kwargs['embed_dims'][-1], output_dim=clip_kw['proj_dim'], fc_params=clip_kw['main_cont_fc_parmas'], bias_last=False)
@@ -213,13 +221,12 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
             # FC (for classifications) and projections (for contrastive loss)
             if self.clip_mode == 'clip-with-cls':
-                if not self.clip_share_token:
-                    # 主模型：分类与对比两路分支
+                # 若启用 dual，则无视 share_token：主分支强制分为分类与对比两路
+                if getattr(self, 'dual_cls_blocks', False):
                     x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
                     logits = self.mod_fc(x_mod_cls)
                     x_mod = self.mod_proj(x_mod_clip)
 
-                    # gen模型：只用于对比分支，若返回双分支，取对比路
                     if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
                         _, x_gen_clip = x_gen_out
                     elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
@@ -228,11 +235,26 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                         x_gen_clip = x_gen_out
                     x_gen = self.gen_proj(x_gen_clip)
                 else:
-                    # 共享一套表征
-                    assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
-                    logits = self.mod_fc(x_mod_out)
-                    x_mod = self.mod_proj(x_mod_out)
-                    x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
+                    if not self.clip_share_token:
+                        # 主模型：分类与对比两路分支
+                        x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
+                        logits = self.mod_fc(x_mod_cls)
+                        x_mod = self.mod_proj(x_mod_clip)
+
+                        # gen模型：只用于对比分支，若返回双分支，取对比路
+                        if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
+                            _, x_gen_clip = x_gen_out
+                        elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
+                            x_gen_clip = x_gen_out[:, 1]
+                        else:
+                            x_gen_clip = x_gen_out
+                        x_gen = self.gen_proj(x_gen_clip)
+                    else:
+                        # 共享一套表征
+                        assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
+                        logits = self.mod_fc(x_mod_out)
+                        x_mod = self.mod_proj(x_mod_out)
+                        x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
 
             elif self.clip_mode == 'clip-with-gencls':
                 if not self.clip_share_token:
@@ -297,7 +319,19 @@ class CLIPLoss(torch.nn.Module):
         super().__init__()
         self.clip_mode = clip_mode
         self.beta = beta
+        # 初始 alpha（仅作 EMA 初值与回退用）
         self.alpha = alpha
+        # 基于梯度范数的自适应混合开关与超参数（默认开启）
+        self.use_grad_balance = True
+        self.grad_balance_c = 1.0
+        self.grad_balance_eps = 1e-8
+        self.grad_balance_alpha_min = 1e-4
+        self.grad_balance_alpha_max = 1e4
+        self.grad_balance_ema_rho = 0.9
+        # 使用重算以降低显存峰值（多卡强烈建议开启）
+        self.grad_balance_recompute = True
+        # 运行时 EMA 平滑后的 alpha
+        self.alpha_dyn = float(alpha)
         if clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -323,34 +357,8 @@ class CLIPLoss(torch.nn.Module):
             # compute cosine similarity
             logit_scale = self.logit_scale.exp()
             logits_cont_2d = logit_scale * x_mod @ x_gen.t() # (batch, batch)
-            
-            # 根据 labels >= 161 的条件，创建掩码去除 gen 维度对应的行
-            # 当 labels >= 161 时，对应的样本在 gen 维度上应该被排除
-            mask_gen = labels < 161  # True 表示保留，False 表示排除
-            
-            # 直接删除 mask_gen 为 False 的行和列，改变矩阵大小
-            if not mask_gen.all():  # 如果存在需要排除的样本
-                # 获取需要保留的索引
-                keep_indices = torch.where(mask_gen)[0]
-                
-                # 删除相应的行和列
-                logits_cont_2d = logits_cont_2d[keep_indices][:, keep_indices]  # 同时删除行和列
-                
-                # 更新 indices 以匹配新的矩阵大小
-                indices = torch.arange(len(keep_indices)).to(x_mod.device)
-            else:
-                # 如果没有需要排除的样本，保持原来的 indices
-                indices = torch.arange(x_mod.size(0)).to(x_mod.device)
-            
             logits_cont_2d_t = logits_cont_2d.t()
-
-            try:
-                torch.set_printoptions(profile="full")
-                print(logits_cont_2d)
-                print(logits_cont_2d.shape)
-            finally:
-                torch.set_printoptions(profile="default")
-            breakpoint()
+            indices = torch.arange(x_mod.size(0)).to(x_mod.device) # (batch,)
 
             loss_cont = F.cross_entropy(logits_cont_2d, indices) + F.cross_entropy(logits_cont_2d_t, indices)
         else:
@@ -411,8 +419,6 @@ def get_model(data_config, **kwargs):
         proj_dim=128,
         share_token=False,
         dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
-        enlarge=False,
-        gen_enlarge=True,
         exclude=[],
         main_cont_fc_parmas=[],
         gen_cont_fc_parmas=[],
@@ -433,9 +439,9 @@ def get_model(data_config, **kwargs):
         assert k in cfg, 'Invalid key %s' % k
         cfg[k] = v
     
-    # 仅在 clip-with-cls 且不共享 token 时，启用 dual_cls_blocks（开关位于 clip_kw）
-    if cfg['clip_kw']['mode'] == 'clip-with-cls' and (not cfg['clip_kw']['share_token']):
-        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', True)
+    # 在 clip-with-cls 模式下，dual_cls_blocks 完全由 clip_kw 控制；若未提供则默认 False
+    if cfg['clip_kw']['mode'] == 'clip-with-cls':
+        cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', False)
 
     _logger.info('Model config: %s' % str(cfg))
 
@@ -501,9 +507,69 @@ def train_classification_sophon_clip(
             label = y[data_config.label_names[0]].long().to(dev) # label is obtained from inputs
             entry_count += label.shape[0]
             opt.zero_grad()
-            with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
-                logits, x_mod, x_gen = model(*inputs)
-                loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+            # 低峰值显存模式：分别重算以获取 g_cls 与 g_cont，避免 retain_graph
+            if getattr(loss_func, 'use_grad_balance', False):
+                if getattr(loss_func, 'grad_balance_recompute', True):
+                    # Pass A: L_cls -> g_norm_cls（不保留计算图）
+                    with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                        logits_a, x_mod_a, x_gen_a = model(*inputs)
+                        _, loss_cls_a, _ = loss_func(logits_a, x_mod_a, x_gen_a, label)
+                    # 用末端张量近似：对分类用 logits 的梯度范数，显存占用最小
+                    g_list_cls = torch.autograd.grad(loss_cls_a, logits_a, retain_graph=False, allow_unused=True)
+                    g_norm_cls = 0.0
+                    for g in (g_list_cls if isinstance(g_list_cls, (list, tuple)) else [g_list_cls]):
+                        if g is not None:
+                            g_norm_cls = g_norm_cls + g.pow(2).sum()
+                    g_norm_cls = torch.sqrt(g_norm_cls + 1e-16)
+
+                    # Pass B: L_cont -> g_norm_cont（不保留计算图）
+                    with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                        logits_b, x_mod_b, x_gen_b = model(*inputs)
+                        _, _, loss_cont_b = loss_func(logits_b, x_mod_b, x_gen_b, label)
+                    # 若无对比项（例如 cls-only），直接回退固定 alpha
+                    if x_mod_b is None:
+                        alpha_used = loss_func.alpha
+                    else:
+                        # 对比项用 x_mod（投影后特征）的梯度范数
+                        g_list_cont = torch.autograd.grad(loss_cont_b, x_mod_b, retain_graph=False, allow_unused=True)
+                        g_norm_cont = 0.0
+                        for g in (g_list_cont if isinstance(g_list_cont, (list, tuple)) else [g_list_cont]):
+                            if g is not None:
+                                g_norm_cont = g_norm_cont + g.pow(2).sum()
+                        g_norm_cont = torch.sqrt(g_norm_cont + 1e-16)
+
+                        # alpha_t 与 EMA
+                        alpha_t = loss_func.grad_balance_c * (g_norm_cls / (g_norm_cont + loss_func.grad_balance_eps))
+                        alpha_t = torch.clamp(alpha_t,
+                                              min=loss_func.grad_balance_alpha_min,
+                                              max=loss_func.grad_balance_alpha_max)
+                        alpha_t_scalar = float(alpha_t.detach().cpu())
+                        loss_func.alpha_dyn = (
+                            loss_func.grad_balance_ema_rho * float(loss_func.alpha_dyn)
+                            + (1.0 - loss_func.grad_balance_ema_rho) * alpha_t_scalar
+                        )
+                        alpha_used = loss_func.alpha_dyn
+
+                    # Pass C: 最终前向与反向
+                    with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                        logits, x_mod, x_gen = model(*inputs)
+                        loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+                        if x_mod is not None:
+                            loss = loss_func.beta * loss_cls + alpha_used * loss_cont
+                        else:
+                            loss = loss_func.beta * loss_cls
+                else:
+                    # 回退：单次前向直接用固定 alpha
+                    with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                        logits, x_mod, x_gen = model(*inputs)
+                        loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+                        loss = loss_func.beta * loss_cls + loss_func.alpha * loss_cont
+                    alpha_used = loss_func.alpha
+            else:
+                with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                    logits, x_mod, x_gen = model(*inputs)
+                    loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
+
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
@@ -533,6 +599,8 @@ def train_classification_sophon_clip(
                 'Loss': '%.5f' % loss,
                 'AvgLoss': '%.5f' % (total_loss / num_batches),
             }
+            if getattr(loss_func, 'use_grad_balance', False) and (x_mod is not None):
+                tq_dict.update({'alpha': '%.5f' % float(loss_func.alpha_dyn)})
 
             if logits is not None:
                 _, preds = logits.max(1)

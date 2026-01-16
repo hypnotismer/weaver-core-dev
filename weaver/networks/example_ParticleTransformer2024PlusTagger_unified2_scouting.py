@@ -58,13 +58,6 @@ class ParticleTransformerTaggerForFinetune(nn.Module):
         self.num_ft_nodes = finetune_kw.get('num_ft_nodes')
         self.freeze_main_params = finetune_kw.get('freeze_main_params', True)
 
-        # If requested, fully freeze the main model parameters so DDP does not
-        # expect gradients for them. This avoids "unused parameter" issues when
-        # fine-tuning with external heads that bypass parts of the main network.
-        if self.freeze_main_params:
-            for p in self.main.parameters():
-                p.requires_grad = False
-
         fc_params = finetune_kw.get('fc_params')
         self.fc_suff_kw = finetune_kw.get('fc_suff_kw', None)
 
@@ -117,8 +110,7 @@ class ParticleTransformerTaggerForFinetune(nn.Module):
         else:
             output = 0
 
-        # process suffix FC (if valid) 
-        # -> modify "output" if new layers (fc_suff) are appended after the main model output / after intermediate hidden/fc.0 layers
+        # process suffix FC (if valid)
         with torch.autocast('cuda', enabled=self.main.use_amp):
             if self.fc_suff is not None:
                 append_after = self.fc_suff_kw.get('append_after')
@@ -127,6 +119,7 @@ class ParticleTransformerTaggerForFinetune(nn.Module):
                 elif append_after == 'hidden':
                     output = self.fc_suff(x)
                 elif append_after == 'fc.0':
+                    self.main.part.fc[0].eval()
                     output = self.main.part.fc[0](x)
                     output = self.fc_suff(output)
                 else:
@@ -156,21 +149,6 @@ class ParticleTransformerTaggerForFinetune(nn.Module):
         if self.for_inference:
             if self.mode == 'cls':
                 output = torch.softmax(output, dim=1)
-        
-        # Ensure all trainable parameters participate in the autograd graph on every forward.
-        # This avoids DistributedDataParallel error: "Expected to have finished reduction..."
-        # which can happen when some parameters (e.g. heads not used under certain fine-tuning
-        # configurations) do not receive gradients in a particular iteration.
-        # By adding a zero-valued dependency on every trainable parameter, we keep numerical
-        # outputs unchanged while guaranteeing graph connectivity for DDP.
-        if self.training and torch.is_grad_enabled():
-            with torch.autocast('cuda', enabled=self.main.use_amp):
-                zero = torch.zeros((), device=output.device, dtype=output.dtype)
-                for p in self.parameters():
-                    if p.requires_grad:
-                        # zero-valued dependency; does not change output but keeps params in graph
-                        zero = zero + (p.view(-1)[0] * 0.0)
-                output = output + zero
         return output
 
 
@@ -186,7 +164,7 @@ def get_model(data_config, **kwargs):
 
     # use SwiGLU-default setup
     cfg = dict(
-        input_dims=tuple(map(lambda x: len(data_config.input_dicts[x]), ['cpf_features', 'npf_features', 'sv_features'])),
+        input_dims=tuple(map(lambda x: len(data_config.input_dicts[x]), ['cpf_features', 'npf_features'])),
         share_embed=False,
         num_classes=num_nodes,
         # network configurations

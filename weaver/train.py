@@ -123,7 +123,7 @@ parser.add_argument('--samples-per-epoch', type=int, default=None,
 parser.add_argument('--samples-per-epoch-val', type=int, default=None,
                     help='number of samples per epochs for validation; '
                          'if neither of `--steps-per-epoch-val` or `--samples-per-epoch-val` is set, each epoch will run over all loaded samples')
-parser.add_argument('--optimizer', type=str, default='ranger', choices=['adam', 'adamW', 'radam', 'ranger', 'sgd'],  # TODO: add more
+parser.add_argument('--optimizer', type=str, default='ranger', choices=['adam', 'adamW', 'radam', 'ranger', 'sgd', 'lora'],  # TODO: add more
                     help='optimizer for the training')
 parser.add_argument('--optimizer-option', nargs=2, action='append', default=[],
                     help='options to pass to the optimizer class constructor, e.g., `--optimizer-option weight_decay 1e-4`')
@@ -519,6 +519,63 @@ def optim(args, model, device):
         opt = torch.optim.RAdam(parameters, lr=args.start_lr, **optimizer_options)
     elif args.optimizer == 'sgd':
         opt = torch.optim.SGD(parameters, lr=args.start_lr, **optimizer_options)
+    elif args.optimizer == 'lora':
+        # Build param groups for LoRA-style fine-tuning:
+        # - select parameters whose names contain "lora" (case-insensitive) as LoRA params
+        # - optionally include other trainable params if include_others=True
+        # - default: only optimize LoRA params with zero weight decay
+        lora_params, other_params = [], []
+        lora_param_names = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'lora' in name.lower() or name.endswith('.lora_A') or name.endswith('.lora_B') or name.endswith('.lora_up') or name.endswith('.lora_down'):
+                lora_params.append(param)
+                lora_param_names.append(name)
+            else:
+                other_params.append(param)
+        # pop LoRA-specific options
+        lora_lr = optimizer_options.pop('lora_lr', args.start_lr)
+        lora_weight_decay = optimizer_options.pop('lora_weight_decay', 0.0)
+        include_others = optimizer_options.pop('include_others', False)
+        # if no LoRA params found, fallback to all trainable params
+        if len(lora_params) == 0:
+            _logger.warning('LoRA optimizer selected but no LoRA parameters were found. Falling back to all trainable parameters.')
+            lora_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+            other_params = []
+            lora_param_names = ['<all trainable params>']
+        # Build groups
+        param_groups = [
+            {'params': lora_params, 'weight_decay': float(lora_weight_decay), 'lr': float(lora_lr)},
+        ]
+        if include_others and len(other_params):
+            wd_rest = float(optimizer_options.pop('weight_decay', 0.0))
+            param_groups.append({'params': other_params, 'weight_decay': wd_rest, 'lr': args.start_lr})
+        _logger.info('LoRA optimizer: %d LoRA params, %d other params (include_others=%s). Example LoRA name(s): %s',
+                     len(lora_params), len(other_params), include_others, ', '.join(lora_param_names[:5]))
+        # Use AdamW by default for LoRA groups
+        from utils.nn.optimizer.ranger import Ranger
+        opt = Ranger(param_groups, **optimizer_options)
+        # Log trainable vs frozen modules (by parameter prefix without the leaf name)
+        trainable_modules = set()
+        frozen_modules = set()
+        for pname, p in model.named_parameters():
+            prefix = '.'.join(pname.split('.')[:-1]) if '.' in pname else pname
+            if p.requires_grad:
+                trainable_modules.add(prefix)
+            else:
+                frozen_modules.add(prefix)
+        # Remove overlaps if any artifactually duplicated
+        frozen_modules = frozen_modules - trainable_modules
+        def _fmt_list(s):
+            lst = sorted(s)
+            if len(lst) > 200:
+                return lst[:200] + [f'... (+{len(lst)-200} more)']
+            return lst
+        _logger.info('LoRA mode - Trainable modules (%d):\n - %s',
+                     len(trainable_modules), '\n - '.join(_fmt_list(trainable_modules)))
+        _logger.info('LoRA mode - Frozen modules (%d):\n - %s',
+                     len(frozen_modules), '\n - '.join(_fmt_list(frozen_modules)))
 
     # load previous training and resume if `--load-epoch` is set
     if args.load_epoch is not None:
@@ -550,7 +607,7 @@ def optim(args, model, device):
                 def get_lr(epoch): return gamma ** max(0, epoch - milestones[0] + 1)  # noqa
                 scheduler = torch.optim.lr_scheduler.LambdaLR(
                     opt, (lambda _: 1, lambda _: 1, get_lr, get_lr),
-                    last_epoch=-1 if args.load_epoch is None else args.load_epoch, verbose=True)
+                    last_epoch=-1 if args.load_epoch is None else args.load_epoch)
             else:
                 scheduler = torch.optim.lr_scheduler.MultiStepLR(
                     opt, milestones=milestones, gamma=gamma,
@@ -1058,7 +1115,12 @@ def _main(args):
         # DistributedDataParallel
         if args.backend is not None:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=gpus, output_device=local_rank)
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=gpus,
+                output_device=local_rank,
+                find_unused_parameters=True,  # allow heads not used (e.g., logits_weight=0)
+            )
 
         # optimizer & learning rate
         opt, scheduler = optim(args, model, dev)
