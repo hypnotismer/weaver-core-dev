@@ -1,3 +1,8 @@
+# For Deep Learning 2025
+Find network file for VQ in: weaver/networks/pheno2/example_Sophon_VQVAE.py
+Find configuration YAML file for VQ in: weaver/data-pheno/JetClassII_v2/JetClassII_full_VQVAE_nonscale_manual.yaml
+Find training commands in: weaver/train_VQ.sh (change DATADIR into your own directory)
+
 # NOTE
 This repo is not an organized framework but just a backup of a local directory
 starting from the https://github.com/hqucms/weaver-core
