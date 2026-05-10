@@ -1,6 +1,7 @@
 import time
 import glob
 import copy
+import gc
 import numpy as np
 import awkward as ak
 
@@ -197,7 +198,7 @@ class WeightMaker(object):
         table = _clean_up(table, self.load_branches - all_needed_vars)
         return table
 
-    def make_weights(self, table):
+    def _make_raw_hists(self, table):
         x_var, y_var = self._data_config.reweight_branches
         x_bins, y_bins = self._data_config.reweight_bins
         if not self._data_config.reweight_discard_under_overflow:
@@ -212,29 +213,35 @@ class WeightMaker(object):
         _logger.info('Using %d events to make weights', len(table))
 
         sum_evts = 0
-        max_weight = 0.9
         raw_hists = {}
-        class_events = {}
-        result = {}
         for label in self._data_config.reweight_classes:
             pos = (table[label] == 1)
             x = ak.to_numpy(table[x_var][pos])
             y = ak.to_numpy(table[y_var][pos])
             hist, _, _ = np.histogram2d(x, y, bins=self._data_config.reweight_bins)
-            _logger.info('%s (unweighted):\n %s', label, str(hist.astype('int64')))
             sum_evts += hist.sum()
             if self._data_config.reweight_basewgt:
                 w = ak.to_numpy(table[self._data_config.basewgt_name][pos])
                 hist, _, _ = np.histogram2d(x, y, weights=w, bins=self._data_config.reweight_bins)
-                _logger.info('%s (weighted):\n %s', label, str(hist.astype('float32')))
             raw_hists[label] = hist.astype('float32')
-            result[label] = hist.astype('float32')
-        if sum_evts != len(table):
+        return raw_hists, sum_evts, len(table)
+
+    def _make_weights_from_raw_hists(self, raw_hists, sum_evts, total_events, table=None):
+        max_weight = 0.9
+        class_events = {}
+        result = {label: hist.copy() for label, hist in raw_hists.items()}
+
+        for label in self._data_config.reweight_classes:
+            _logger.info('%s (unweighted):\n %s', label, str(raw_hists[label].astype('int64')))
+            if self._data_config.reweight_basewgt:
+                _logger.info('%s (weighted):\n %s', label, str(raw_hists[label].astype('float32')))
+
+        if sum_evts != total_events:
             _logger.warning(
                 'Only %d (out of %d) events actually used in the reweighting. '
                 'Check consistency between `selection` and `reweight_classes` definition, or with the `reweight_vars` binnings '
                 '(under- and overflow bins are discarded by default, unless `reweight_discard_under_overflow` is set to `False` in the `weights` section).',
-                sum_evts, len(table))
+                sum_evts, total_events)
             time.sleep(10)
 
         if self._data_config.reweight_method == 'flat':
@@ -310,6 +317,8 @@ class WeightMaker(object):
             result[label] *= class_wgt
 
         if self._data_config.reweight_basewgt:
+            if table is None:
+                raise RuntimeError('Chunked WeightMaker does not support `reweight_basewgt` yet.')
             wgts = _build_weights(table, self._data_config, reweight_hists=result)
             wgt_ref = np.percentile(wgts, 100 - self._data_config.reweight_threshold)
             _logger.info('Set overall reweighting scale factor (%d threshold) to %s (max %s)' %
@@ -327,8 +336,47 @@ class WeightMaker(object):
 
         return result
 
+    def make_weights(self, table):
+        raw_hists, sum_evts, total_events = self._make_raw_hists(table)
+        return self._make_weights_from_raw_hists(raw_hists, sum_evts, total_events, table=table)
+
     def produce(self, output=None):
-        table = self.read_file(self._filelist)
+        if self._data_config.reweight_basewgt:
+            table = self.read_file(self._filelist)
+            wgts = self.make_weights(table)
+        else:
+            chunk_size = int(self._data_config.options['weights'].get('reweight_chunk_size', 50))
+            chunk_size = max(1, chunk_size)
+            _logger.info('Making weights in chunks of %d files', chunk_size)
+            raw_hists = None
+            sum_evts = 0
+            total_events = 0
+            for start in range(0, len(self._filelist), chunk_size):
+                chunk_files = self._filelist[start:start + chunk_size]
+                _logger.info(
+                    'Processing weight chunk %d-%d / %d',
+                    start + 1, min(start + chunk_size, len(self._filelist)), len(self._filelist))
+                try:
+                    table = self.read_file(chunk_files)
+                except RuntimeError as e:
+                    if 'Zero entries loaded' in str(e):
+                        _logger.warning('Skipping empty weight chunk %d-%d: %s',
+                                        start + 1, min(start + chunk_size, len(self._filelist)), e)
+                        continue
+                    raise
+                chunk_hists, chunk_sum_evts, chunk_total_events = self._make_raw_hists(table)
+                if raw_hists is None:
+                    raw_hists = {label: hist.copy() for label, hist in chunk_hists.items()}
+                else:
+                    for label in self._data_config.reweight_classes:
+                        raw_hists[label] += chunk_hists[label]
+                sum_evts += chunk_sum_evts
+                total_events += chunk_total_events
+                del table
+                gc.collect()
+            if raw_hists is None:
+                raise RuntimeError('Zero entries loaded when making weights.')
+            wgts = self._make_weights_from_raw_hists(raw_hists, sum_evts, total_events)
         ## for debugging ##
         # # write table:
         # import pickle
@@ -336,7 +384,6 @@ class WeightMaker(object):
         #     pickle.dump(table, f)
         # with open('table.pkl', 'rb') as f:
         #     table = pickle.load(f)
-        wgts = self.make_weights(table)
         self._data_config.reweight_hists = wgts
         # must also propogate the changes to `data_config.options` so it can be persisted
         self._data_config.options['weights']['reweight_hists'] = {k: v.tolist() for k, v in wgts.items()}

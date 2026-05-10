@@ -302,13 +302,24 @@ def _read_root(filepath, branches, load_range=None, treename=None):
     import uproot
     with uproot.open(filepath, object_cache=None, array_cache=None) as f:
         if treename is None:
-            treenames = set([k.split(';')[0] for k, v in f.items() if getattr(v, 'classname', '') == 'TTree'])
-            if len(treenames) == 1:
-                treename = treenames.pop()
+            tree_keys = {}
+            for k, v in f.items():
+                if getattr(v, 'classname', '') != 'TTree':
+                    continue
+                name, sep, cycle = k.rpartition(';')
+                logical_name = name if sep else k
+                cycle = int(cycle) if sep and cycle.isdigit() else -1
+                if logical_name not in tree_keys or cycle > tree_keys[logical_name][0]:
+                    tree_keys[logical_name] = (cycle, k)
+            if len(tree_keys) == 1:
+                # Multiple ROOT cycles can share the same logical tree name; use the newest one.
+                treename = next(iter(tree_keys.values()))[1]
+            elif len(tree_keys) == 0:
+                raise RuntimeError('No TTree found in file %s' % filepath)
             else:
                 raise RuntimeError(
-                    'Need to specify `treename` as more than one trees are found in file %s: %s' %
-                    (filepath, str(branches)))
+                    'Need to specify `treename` as more than one logical trees are found in file %s: %s' %
+                    (filepath, str(sorted(tree_keys))))
         tree = f[treename]
         if load_range is not None:
             start = math.trunc(load_range[0] * tree.num_entries)

@@ -1,0 +1,352 @@
+### use `&`, `|`, `~` for logical operations on numpy arrays
+### can use functions from `math`, `np` (numpy), and `ak` in the expression
+
+## == NOTE for non-MD training ==
+## should always require event_no%7!=0
+selection: >-
+    (jet_tightId==1) & (jet_no<2) & (fj_pt>200) & (fj_pt<2500) & (fj_sdmass>=20) & (fj_sdmass<260) & (ak.num(cpfcandlt_px) + ak.num(npfcand_px) > 0) &
+    (
+      ((fj_label >= 309) & (fj_label < 314) & (event_no%7!=0)) |
+      ((fj_label >= 0) & (fj_label <= 16) & (event_no%7!=0)) |
+      ((fj_label==24) & (event_no%7!=0))
+    )
+### selection to apply at test time (i.e., when running w/ --predict)
+# starting from v8: we have dedicated QCD dataset for test only - they compose of 1/7 full events.
+# for QCD: just use 1/2 of events, so we have 1/14 of full events
+# for top: we have inference dataset storing event_no%7==0 events
+# for W/Z: we should select by event_no%7==0 to make it orthogonal to training events
+test_time_selection: >-
+    (jet_tightId==1) & (jet_no<2) &
+    (
+      ((fj_label >= 309) & (fj_label < 314) & (event_no%7==0) & ((event_label==2000) | (event_label==3000) | (event_label==4000) | (event_label==5000) | (event_label==6000))) |
+      ((fj_label >= 0) & (fj_label <= 16) & (event_no%7==0) & ((event_label==2000) | (event_label==3000) | (event_label==4000) | (event_label==5000) | (event_label==6000))) |
+      ((fj_label==24) & (event_label==1000))
+    )
+
+new_variables:
+    ### [format] name: formula
+    ### can use functions from `math`, `np` (numpy), and `ak` in the expression
+    # ordered by pt
+    cpfcandlt_index: ak.argsort(cpfcandlt_pt_nopuppi, axis=-1, ascending=False)
+    cpfcandlt_pt_log_nopuppi_sort: cpfcandlt_pt_log_nopuppi[cpfcandlt_index]
+    cpfcandlt_e_log_nopuppi_sort: cpfcandlt_e_log_nopuppi[cpfcandlt_index]
+    cpfcandlt_etarel_sort: cpfcandlt_etarel[cpfcandlt_index]
+    cpfcandlt_phirel_sort: cpfcandlt_phirel[cpfcandlt_index]
+    cpfcandlt_abseta_sort: cpfcandlt_abseta[cpfcandlt_index]
+    cpfcandlt_charge_sort: cpfcandlt_charge[cpfcandlt_index]
+    cpfcandlt_isEl_sort: cpfcandlt_isEl[cpfcandlt_index]
+    cpfcandlt_isMu_sort: cpfcandlt_isMu[cpfcandlt_index]
+    cpfcandlt_isChargedHad_sort: cpfcandlt_isChargedHad[cpfcandlt_index]
+    cpfcandlt_isLostTrack_sort: cpfcandlt_isLostTrack[cpfcandlt_index]
+    cpfcandlt_VTX_ass_sort: cpfcandlt_VTX_ass[cpfcandlt_index]
+    cpfcandlt_lostInnerHits_sort: cpfcandlt_lostInnerHits[cpfcandlt_index]
+    cpfcandlt_normchi2_sort: cpfcandlt_normchi2[cpfcandlt_index]
+    cpfcandlt_quality_sort: cpfcandlt_quality[cpfcandlt_index]
+    cpfcandlt_dz_sort: cpfcandlt_dz[cpfcandlt_index]
+    cpfcandlt_dzsig_sort: cpfcandlt_dzsig[cpfcandlt_index]
+    cpfcandlt_dxy_sort: cpfcandlt_dxy[cpfcandlt_index]
+    cpfcandlt_dxysig_sort: cpfcandlt_dxysig[cpfcandlt_index]
+    cpfcandlt_btagEtaRel_sort: cpfcandlt_btagEtaRel[cpfcandlt_index]
+    cpfcandlt_btagPtRatio_sort: cpfcandlt_btagPtRatio[cpfcandlt_index]
+    cpfcandlt_btagPParRatio_sort: cpfcandlt_btagPParRatio[cpfcandlt_index]
+    cpfcandlt_btagSip3dVal_sort: cpfcandlt_btagSip3dVal[cpfcandlt_index]
+    cpfcandlt_btagSip3dSig_sort: cpfcandlt_btagSip3dSig[cpfcandlt_index]
+    cpfcandlt_btagJetDistVal_sort: cpfcandlt_btagJetDistVal[cpfcandlt_index]
+    cpfcandlt_pixelBarrelLayersWithMeasurement_sort: cpfcandlt_pixelBarrelLayersWithMeasurement[cpfcandlt_index]
+    cpfcandlt_pixelEndcapLayersWithMeasurement_sort: cpfcandlt_pixelEndcapLayersWithMeasurement[cpfcandlt_index]
+    cpfcandlt_stripTECLayersWithMeasurement_sort: cpfcandlt_stripTECLayersWithMeasurement[cpfcandlt_index]
+    cpfcandlt_stripTIBLayersWithMeasurement_sort: cpfcandlt_stripTIBLayersWithMeasurement[cpfcandlt_index]
+    cpfcandlt_stripTIDLayersWithMeasurement_sort: cpfcandlt_stripTIDLayersWithMeasurement[cpfcandlt_index]
+    cpfcandlt_stripTOBLayersWithMeasurement_sort: cpfcandlt_stripTOBLayersWithMeasurement[cpfcandlt_index]
+    cpfcandlt_px_sort: cpfcandlt_px[cpfcandlt_index]
+    cpfcandlt_py_sort: cpfcandlt_py[cpfcandlt_index]
+    cpfcandlt_pz_sort: cpfcandlt_pz[cpfcandlt_index]
+    cpfcandlt_energy_sort: cpfcandlt_energy[cpfcandlt_index]
+    # masks
+    cpfcandlt_mask: ak.ones_like(cpfcandlt_etarel)
+    npfcand_mask: ak.ones_like(npfcand_etarel)
+    sv_mask: ak.ones_like(sv_etarel)
+    # jet features
+    # fj_pt_log: np.log(fj_pt)
+    # fj_mass_log: np.log(fj_mass)
+    fj_pt_log: ak.ones_like(fj_pt)
+    fj_mass_log: ak.ones_like(fj_mass)
+    fj_eta_fake: ak.ones_like(fj_eta)
+    # modified label: Top 0-16; W: 30-31; Z: 37-40; QCD: 309-313
+    # fj_label_nonmd: ak.where(fj_label <= 16, fj_label, ak.where(fj_label <= 31, fj_label - 13, ak.where(fj_label <= 40, fj_label - 18, ak.where(fj_label <= 313, fj_label - 286, -1))))
+    # define labels as seperate boolean arrays
+    ft_label: fj_label + event_label
+    label_xgg_Hgg: (ft_label == 1024)
+    #class for model training
+    label_ttbar_Top: ((ft_label >= 2000) & (ft_label < 2017))
+    label_ttbar_QCD: ((ft_label >= 2309) & (ft_label < 2314))
+    label_wjets_QCD: (((ft_label >= 3309) & (ft_label < 3314)) | ((ft_label >=4309) & (ft_label < 4314)) | ((ft_label >=5309) & (ft_label < 5314)) | ((ft_label >=6309) & (ft_label < 6314)))
+    label_bkg: ((ft_label >= 2000) & (ft_label < 2017)) | ((ft_label >= 2309) & (ft_label < 2314)) | (((ft_label >= 3309) & (ft_label < 3314)) | ((ft_label >=4309) & (ft_label < 4314)) | ((ft_label >=5309) & (ft_label < 5314)) | ((ft_label >=6309) & (ft_label < 6314)))
+    # classes for reweighting
+    label_wjets_100-250: (event_label == 3000)
+    label_wjets_250-400: (event_label == 4000)
+    label_wjets_400-600: (event_label == 5000)
+    label_wjets_600-inf: (event_label == 6000)
+    label_ttbar: (event_label == 2000)
+    label_xgg: (event_label == 1000)
+    #label_TTbar_Top_bWQQ: ((fj_label >= 2000) & (fj_label < 2002))
+    #label_Wjets_Top_bWQQ: ((fj_label >= 3000) & (fj_label < 3002))
+    #label_TTbar_Top_bWQ: ((fj_label >= 2002) & (fj_label < 2005))
+    #label_Wjets_Top_bWQ: ((fj_label >= 3002) & (fj_label < 3005))
+    #label_TTbar_Top_bWev: (fj_label == 2005)
+    #label_Wjets_Top_bWev: (fj_label == 2005)
+     # special label
+    #label_Hgg: (fj_label == 24)
+    #label_Top_bWQQ: ((fj_label >= 0) & (fj_label < 2))
+    #label_Top_bWQ: ((fj_label >= 2) & (fj_label < 5))
+    #label_Top_bWev: (fj_label == 5)
+    #label_Top_bWmv: (fj_label == 6)
+    #label_Top_bWtauev: (fj_label == 7)
+    #label_Top_bWtaumv: (fj_label == 8)
+    #label_Top_bWtauhv: (fj_label == 9)
+    #label_Top_WQQ: ((fj_label >= 10) & (fj_label < 12))
+    #label_Top_Wev: (fj_label == 12)
+    #label_Top_Wmv: (fj_label == 13)
+    #label_Top_Wtauev: (fj_label == 14)
+    #label_Top_Wtaumv: (fj_label == 15)
+    #label_Top_Wtauhv: (fj_label == 16)
+    #label_QCD_bb: (sample_isQCD==1) & (fj_label == 309)
+    #label_QCD_cc: (sample_isQCD==1) & (fj_label == 310)
+    #label_QCD_b: (sample_isQCD==1) & (fj_label == 311)
+    #label_QCD_c: (sample_isQCD==1) & (fj_label == 312)
+    #label_QCD_others: (sample_isQCD==1) & (fj_label == 313)
+
+preprocess:
+    ### method: [manual, auto] - whether to use manually specified parameters for variable standardization
+    method: manual
+    ### data_fraction: fraction of events to use when calculating the mean/scale for the standardization
+    data_fraction:
+
+inputs:
+    cpf_features:
+        length: 110
+        pad_mode: wrap
+        vars:
+            ### [format 1]: var_name (no transformation)
+            ### [format 2]: [var_name,
+            ###              subtract_by(optional, default=None, no transf. if preprocess.method=manual, auto transf. if preprocess.method=auto),
+            ###              multiply_by(optional, default=1),
+            ###              clip_min(optional, default=-5),
+            ###              clip_max(optional, default=5),
+            ###              pad_value(optional, default=0)]
+            - [cpfcandlt_pt_log_nopuppi_sort, 1, 0.5]
+            - [cpfcandlt_e_log_nopuppi_sort, 1.3, 0.5]
+            - cpfcandlt_etarel_sort
+            - cpfcandlt_phirel_sort
+            - [cpfcandlt_abseta_sort, 0.7, 1.4]
+            - cpfcandlt_charge_sort
+            - cpfcandlt_isEl_sort
+            - cpfcandlt_isMu_sort
+            - cpfcandlt_isChargedHad_sort
+            - cpfcandlt_isLostTrack_sort
+            - [cpfcandlt_VTX_ass_sort, 4, 0.3]
+            - cpfcandlt_lostInnerHits_sort
+            - [cpfcandlt_normchi2_sort, 5, 0.2]
+            - [cpfcandlt_quality_sort, 0, 0.2]
+            - [cpfcandlt_dz_sort, 0, 130]
+            - [cpfcandlt_dzsig_sort, 0, 1.2]
+            - [cpfcandlt_dxy_sort, 0.0, 200]
+            - [cpfcandlt_dxysig_sort, 0, 1.6]
+            - [cpfcandlt_btagEtaRel_sort, 1.5, 0.5]
+            - [cpfcandlt_btagPtRatio_sort, 0, 1]
+            - [cpfcandlt_btagPParRatio_sort, 0, 1]
+            - [cpfcandlt_btagSip3dVal_sort, 0, 100]
+            - [cpfcandlt_btagSip3dSig_sort, 0, 0.5]
+            - [cpfcandlt_btagJetDistVal_sort, 0, 40]
+            - [cpfcandlt_pixelBarrelLayersWithMeasurement_sort, 0, 0.1]
+            - [cpfcandlt_pixelEndcapLayersWithMeasurement_sort, 0, 0.1]
+            - [cpfcandlt_stripTECLayersWithMeasurement_sort, 0, 0.1]
+            - [cpfcandlt_stripTIBLayersWithMeasurement_sort, 0, 0.1]
+            - [cpfcandlt_stripTIDLayersWithMeasurement_sort, 0, 0.1]
+            - [cpfcandlt_stripTOBLayersWithMeasurement_sort, 0, 0.1]
+    cpf_vectors:
+        length: 110
+        pad_mode: wrap
+        vars:
+            - [cpfcandlt_px_sort, null]
+            - [cpfcandlt_py_sort, null]
+            - [cpfcandlt_pz_sort, null]
+            - [cpfcandlt_energy_sort, null]
+    cpf_mask:
+        length: 110
+        pad_mode: constant
+        vars:
+            - cpfcandlt_mask
+    npf_features:
+        length: 75
+        pad_mode: wrap
+        vars:
+            - [npfcand_pt_log_nopuppi, 1, 0.5]
+            - [npfcand_e_log_nopuppi, 1.3, 0.5]
+            - npfcand_etarel
+            - npfcand_phirel
+            - [npfcand_abseta, 0.7, 1.4]
+            - npfcand_isGamma
+            - npfcand_isNeutralHad
+    npf_vectors:
+        length: 75
+        pad_mode: wrap
+        vars:
+            - [npfcand_px, null]
+            - [npfcand_py, null]
+            - [npfcand_pz, null]
+            - [npfcand_energy, null]
+    npf_mask:
+        length: 75
+        pad_mode: constant
+        vars:
+            - npfcand_mask
+    sv_features:
+        length: 10
+        pad_mode: wrap
+        vars:
+            - [sv_pt_log, 4, 0.6]
+            - [sv_mass, 1.2, 0.3]
+            - sv_etarel
+            - sv_phirel
+            - [sv_abseta, 0.5, 1.6]
+            - [sv_ntracks, 3, 1]
+            - [sv_normchi2, 0.8, 0.6]
+            - [sv_dxy, 0.4, 0.25]
+            - [sv_dxysig, 7, 0.02]
+            - [sv_d3d, 0.5, 0.2]
+            - [sv_d3dsig, 7, 0.02]
+    sv_vectors:
+        length: 10
+        pad_mode: wrap
+        vars:
+            - [sv_px, null]
+            - [sv_py, null]
+            - [sv_pz, null]
+            - [sv_energy, null]
+    sv_mask:
+        length: 10
+        pad_mode: constant
+        vars:
+            - sv_mask
+    jet_features:
+        length: 1
+        vars:
+            - [fj_pt_log, 7., 2.]
+            - [fj_mass_log, 5., 0.8]
+            - fj_eta_fake
+
+labels:
+    ### type can be `simple`, `custom`, 'hybrid'
+    type: simple
+    value: [
+        label_xgg_Hgg, 
+        label_ttbar_Top, label_ttbar_QCD, label_wjets_QCD
+        ]
+
+
+observers:
+    - event_no
+    - fj_label
+    - event_label
+    - ft_label
+    - fj_pt
+    - fj_eta
+    - fj_phi
+    - fj_mass
+    - fj_sdmass
+    - fj_gen_mass
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probHgg
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWcs
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWev
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWmv
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWqq
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWtauev
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWtaumv
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWtauhv
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWc
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWcs
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWev
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWmv
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWq
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWqq
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWs
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWtauev
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWtaumv
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopbWtauhv
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probQCDb
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probQCDbb
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probQCDc
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probQCDcc
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probQCDothers
+
+
+
+weights:
+    ### [option 1] use precomputed weights stored in the input files
+    # use_precomputed_weights: true
+    # weight_branches: [weight, class_weight]
+    ### [option 2] compute weights on-the-fly using reweighting histograms
+    use_precomputed_weights: false
+    reweight_method: ref
+    reweight_hist_ref:
+      label_xgg: [
+        [276.786816, 216.713611, 190.371093, 182.685059, 187.994463, 221.442634, 233.055022, 217.373745, 223.119815, 228.408915, 232.858696, 236.882830, 232.887054, 228.245428, 210.658292, 177.299950, 141.932744, 103.907313, 74.026081, 49.955131, 33.398405, 21.144002, 11.948908, 7.204310],
+        [133.631226, 97.404481, 85.555395, 79.284606, 80.450630, 91.853314, 92.545093, 81.215347, 79.822242, 82.046961, 87.508799, 95.550408, 103.753787, 112.129462, 115.562548, 107.761191, 93.603757, 76.003251, 61.741803, 49.787296, 40.637031, 31.904774, 25.093306, 19.125658],
+        [56.580901, 43.511117, 35.073903, 30.514606, 31.463981, 37.259033, 35.609126, 28.991508, 28.782954, 28.785643, 31.113849, 32.948892, 36.692743, 42.849811, 46.679572, 43.871268, 38.400021, 32.933087, 28.300495, 24.557554, 22.290592, 19.887265, 17.377270, 14.989280],
+        [23.843179, 17.928729, 14.290989, 11.706897, 12.324162, 14.104515, 13.173559, 10.755701, 9.742324, 10.711453, 10.845211, 10.689807, 13.097561, 15.492754, 16.400754, 14.428215, 11.717188, 9.803707, 8.032707, 8.569697, 7.811224, 8.019555, 6.816001, 7.097124],
+        [9.205331, 6.551862, 5.254190, 4.545977, 4.140355, 4.679767, 4.411853, 3.677666, 3.499152, 3.603558, 3.603065, 3.605554, 4.225596, 5.259944, 5.696456, 4.553714, 3.236689, 2.504468, 2.325553, 2.296227, 2.191971, 2.043348, 2.178750, 2.073372],
+        [3.339576, 2.515279, 1.857530, 1.681242, 1.294633, 1.575664, 1.407478, 1.156571, 1.188228, 1.047224, 1.097076, 1.129875, 1.070744, 1.761131, 1.879297, 1.273162, 0.907946, 0.650628, 0.701746, 0.530216, 0.591366, 0.572888, 0.578807, 0.467646],
+        [1.005985, 0.739134, 0.695230, 0.492714, 0.485128, 0.438400, 0.421390, 0.330375, 0.240409, 0.341507, 0.329054, 0.242812, 0.354081, 0.391497, 0.539395, 0.351820, 0.189007, 0.222490, 0.298942, 0.187512, 0.176761, 0.106305, 0.101446, 0.117198],
+        [0.319902, 0.247869, 0.116559, 0.114234, 0.099353, 0.161309, 0.073680, 0.117471, 0.081855, 0.097525, 0.052675, 0.078963, 0.066468, 0.099057, 0.143655, 0.098997, 0.044836, 0.081465, 0.027440, 0.030590, 0.063425, 0.034383, 0.050072, 0.025904],
+        [0.100329, 0.044863, 0.030071, 0.024318, 0.027226, 0.029690, 0.028221, 0.017043, 0.012295, 0.025103, 0.014877, 0.055873, 0.041367, 0.018889, 0.020296, 0.007838, 0.033117, 0.003606, 0.004741, 0.002776, 0.008982, 0.009664, 0.004872, 0.006492],
+        [0.059978, 0.036044, 0.004369, 0.002663, 0.006858, 0.005764, 0.002138, 0.005222, 0.001619, 0.002606, 0.006177, 0.001099, 0.005608, 0.005486, 0.001976, 0.000876, 0.000876, 0.005083, 0.000658, 0.000487, 0.000557, 0.001915, 0.000923, 0.000551],
+        [0.007233, 0.002361, 0.001767, 0.003974, 0.000658, 0.000380, 0.000278, 0.000232, 0.000241, 0.000162, 0.000139, 0.000116, 0.000116, 0.003641, 0.000070, 0.000023, 0.000046, 0.000171, 0.000116, 0.000046, 0.000070, 0.000139, 0.000162, 0.000148]
+        ]
+    reweight_vars:
+        fj_pt: [200, 251, 316, 398, 501, 630, 793, 997, 1255, 1579, 1987, 2500]
+        fj_sdmass: [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260]
+    reweight_classes:
+        [
+            label_wjets_100-250,
+            label_wjets_250-400,
+            label_wjets_400-600,
+            label_wjets_600-inf,
+            label_ttbar,
+            label_xgg
+        ]
+    class_weights:
+      [
+        770.8,
+        28.06,
+        3.591,
+        0.5491,
+        365.34,
+        1000
+      ]
+    reweight_hists:
+
+    # === 示例：仅对特定类（如 label_xgg）使用参考直方图的 reweight（reweight_method: ref）===
+    # 使用说明：
+    # 1) 将 reweight_method 改为 'ref'
+    # 2) 使用字典形式的 reweight_hist_ref，只为需要应用 ref 的类提供参考直方图；未列出的类将使用单位权重
+    # 3) 参考直方图的形状需要与 (fj_pt, fj_sdmass) 的 reweight_bins 形状一致
+    # 4) 若想恢复对所有类的全局参考，可提供数组形式的 reweight_hist_ref（与过去行为一致）
+    #
+    # 示例：仅对 label_xgg 应用 ref，其它类不变
+    # reweight_method: ref
+    # reweight_hist_ref:
+    #   label_xgg: [
+    #     # 按 fj_pt (行) × fj_sdmass (列) 的 2D 直方图（float32），形状应为
+    #     # (len(reweight_vars.fj_pt)-1, len(reweight_vars.fj_sdmass)-1)
+    #     # 下面仅示意，数值请用你自己的参考分布填充
+    #     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    #     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    #     # ... 共 (len(fj_pt_bins)-1) 行
+    #   ]
+    #
+    # 也可提供多个类的键：
+    # reweight_hist_ref:
+    #   label_xgg: [...]
+    #   label_ttbar: [...]
+
