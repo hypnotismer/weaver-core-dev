@@ -224,9 +224,7 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                 if getattr(self, 'dual_cls_blocks', False):
                     x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
                     logits = self.mod_fc(x_mod_cls)
-                    # projection heads are numerically sensitive under AMP; force fp32 here
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_mod = self.mod_proj(x_mod_clip.float())
+                    x_mod = self.mod_proj(x_mod_clip)
 
                     if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
                         _, x_gen_clip = x_gen_out
@@ -234,15 +232,13 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                         x_gen_clip = x_gen_out[:, 1]
                     else:
                         x_gen_clip = x_gen_out
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_gen = self.gen_proj(x_gen_clip.float())
+                    x_gen = self.gen_proj(x_gen_clip)
                 else:
                     if not self.clip_share_token:
                         # 主模型：分类与对比两路分支
                         x_mod_cls, x_mod_clip = split_outputs(x_mod_out)
                         logits = self.mod_fc(x_mod_cls)
-                        with torch.cuda.amp.autocast(enabled=False):
-                            x_mod = self.mod_proj(x_mod_clip.float())
+                        x_mod = self.mod_proj(x_mod_clip)
 
                         # gen模型：只用于对比分支，若返回双分支，取对比路
                         if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
@@ -251,24 +247,20 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                             x_gen_clip = x_gen_out[:, 1]
                         else:
                             x_gen_clip = x_gen_out
-                        with torch.cuda.amp.autocast(enabled=False):
-                            x_gen = self.gen_proj(x_gen_clip.float())
+                        x_gen = self.gen_proj(x_gen_clip)
                     else:
                         # 共享一套表征
                         assert torch.is_tensor(x_mod_out) and x_mod_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_mod_out, 'shape', None))
                         logits = self.mod_fc(x_mod_out)
-                        with torch.cuda.amp.autocast(enabled=False):
-                            x_mod = self.mod_proj(x_mod_out.float())
-                            _xg = x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out
-                            x_gen = self.gen_proj(_xg.float())
+                        x_mod = self.mod_proj(x_mod_out)
+                        x_gen = self.gen_proj(x_gen_out if torch.is_tensor(x_gen_out) else x_gen_out[1] if isinstance(x_gen_out, tuple) else x_gen_out)
 
             elif self.clip_mode == 'clip-with-gencls':
                 if not self.clip_share_token:
                     # 生成模型：分类与对比两路分支
                     x_gen_cls, x_gen_clip = split_outputs(x_gen_out)
                     logits = self.gen_fc(x_gen_cls)
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_gen = self.gen_proj(x_gen_clip.float())
+                    x_gen = self.gen_proj(x_gen_clip)
 
                     # 主模型：只用于对比分支
                     if isinstance(x_mod_out, tuple) and len(x_mod_out) == 2:
@@ -277,39 +269,30 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
                         x_mod_clip = x_mod_out[:, 1]
                     else:
                         x_mod_clip = x_mod_out
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_mod = self.mod_proj(x_mod_clip.float())
+                    x_mod = self.mod_proj(x_mod_clip)
                 else:
                     # 共享一套表征
                     assert torch.is_tensor(x_gen_out) and x_gen_out.ndim == 2, 'Invalid shape %s' % str(getattr(x_gen_out, 'shape', None))
                     logits = self.gen_fc(x_gen_out)
-                    with torch.cuda.amp.autocast(enabled=False):
-                        _xm = x_mod_out if torch.is_tensor(x_mod_out) else x_mod_out[1] if isinstance(x_mod_out, tuple) else x_mod_out
-                        x_mod = self.mod_proj(_xm.float())
-                        x_gen = self.gen_proj(x_gen_out.float())
+                    x_mod = self.mod_proj(x_mod_out if torch.is_tensor(x_mod_out) else x_mod_out[1] if isinstance(x_mod_out, tuple) else x_mod_out)
+                    x_gen = self.gen_proj(x_gen_out)
 
             elif self.clip_mode == 'clip-only':
                 logits = None
                 # 仅对比学习：若为双分支，取对比路
                 if isinstance(x_mod_out, tuple) and len(x_mod_out) == 2:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_mod = self.mod_proj(x_mod_out[1].float())
+                    x_mod = self.mod_proj(x_mod_out[1])
                 elif torch.is_tensor(x_mod_out) and x_mod_out.ndim == 3 and x_mod_out.size(1) == 2:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_mod = self.mod_proj(x_mod_out[:, 1].float())
+                    x_mod = self.mod_proj(x_mod_out[:, 1])
                 else:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_mod = self.mod_proj(x_mod_out.float())
+                    x_mod = self.mod_proj(x_mod_out)
 
                 if isinstance(x_gen_out, tuple) and len(x_gen_out) == 2:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_gen = self.gen_proj(x_gen_out[1].float())
+                    x_gen = self.gen_proj(x_gen_out[1])
                 elif torch.is_tensor(x_gen_out) and x_gen_out.ndim == 3 and x_gen_out.size(1) == 2:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_gen = self.gen_proj(x_gen_out[:, 1].float())
+                    x_gen = self.gen_proj(x_gen_out[:, 1])
                 else:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        x_gen = self.gen_proj(x_gen_out.float())
+                    x_gen = self.gen_proj(x_gen_out)
 
         elif self.clip_mode in ['cls-only', 'clip-finetune']:
             points, features, lorentz_vectors, mask = args
@@ -331,13 +314,11 @@ class CLIPLoss(torch.nn.Module):
         Computes the CLIP loss and classification loss
     '''
 
-    def __init__(self, clip_mode=None, beta=1., alpha=1., soften=0.):
+    def __init__(self, clip_mode=None, beta=1., alpha=1.):
         super().__init__()
         self.clip_mode = clip_mode
         self.beta = beta
         self.alpha = alpha
-        self.soften = float(soften)
-        assert 0. <= self.soften <= 1., 'soften must be in [0, 1], got %s' % str(self.soften)
         if clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -354,55 +335,19 @@ class CLIPLoss(torch.nn.Module):
         else:
             loss_cls = torch.tensor(0., device=labels.device)
 
-        # CLIP constrastive learning (force fp32 for numerical stability under AMP)
+        # CLIP constrastive learning
+        # normalize the features
         if x_mod is not None:
-            with torch.cuda.amp.autocast(enabled=False):
-                x_mod = x_mod.float()
-                x_gen = x_gen.float()
-                eps = 1e-6
-                x_mod = x_mod / x_mod.norm(dim=-1, keepdim=True).clamp_min(eps)
-                x_gen = x_gen / x_gen.norm(dim=-1, keepdim=True).clamp_min(eps)
+            x_mod = x_mod / x_mod.norm(dim=-1, keepdim=True)
+            x_gen = x_gen / x_gen.norm(dim=-1, keepdim=True)
 
-                # compute cosine similarity
-                # CLIP-style stabilization: clamp the exp(scale) to avoid overflow (esp. under AMP)
-                logit_scale = self.logit_scale.float().exp().clamp(max=100.0)
-                logits_cont_2d = logit_scale * (x_mod @ x_gen.t()) # (batch, batch)
-                logits_cont_2d_t = logits_cont_2d.t()
+            # compute cosine similarity
+            logit_scale = self.logit_scale.exp()
+            logits_cont_2d = logit_scale * x_mod @ x_gen.t() # (batch, batch)
+            logits_cont_2d_t = logits_cont_2d.t()
+            indices = torch.arange(x_mod.size(0)).to(x_mod.device) # (batch,)
 
-            # ---- debug (limited prints): detect non-finite / extreme values ----
-            if not hasattr(self, '_dbg_nonfinite_cnt'):
-                self._dbg_nonfinite_cnt = 0
-            if self._dbg_nonfinite_cnt < 20:
-                for _n, _t in (('x_mod', x_mod), ('x_gen', x_gen), ('logits_cont_2d', logits_cont_2d)):
-                    _finite = torch.isfinite(_t)
-                    if not bool(_finite.all()):
-                        self._dbg_nonfinite_cnt += 1
-                        _logger.warning(
-                            '[CLIPLoss debug] %s nonfinite=%d/%d absmax=%s min=%s max=%s dtype=%s logit_scale=%.3e',
-                            _n,
-                            int((~_finite).sum().item()),
-                            int(_t.numel()),
-                            str(_t.detach().abs().amax().item()),
-                            str(_t.detach().min().item()),
-                            str(_t.detach().max().item()),
-                            str(_t.dtype),
-                            float(logit_scale.detach().item()),
-                        )
-
-            if self.soften > 0.:
-                # soft target matrix: diagonal=1, same-label off-diagonal=soften, then row-normalize.
-                same_label = labels.view(-1, 1).eq(labels.view(1, -1))
-                target = same_label.to(dtype=logits_cont_2d.dtype) * self.soften
-                target.fill_diagonal_(1.)
-                target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-12)
-
-                log_prob = F.log_softmax(logits_cont_2d, dim=1)
-                log_prob_t = F.log_softmax(logits_cont_2d_t, dim=1)
-                # use the row-normalized target distribution for both directions (do NOT transpose after normalization)
-                loss_cont = -(target * log_prob).sum(dim=1).mean() - (target * log_prob_t).sum(dim=1).mean()
-            else:
-                indices = torch.arange(x_mod.size(0), device=x_mod.device) # (batch,)
-                loss_cont = F.cross_entropy(logits_cont_2d, indices) + F.cross_entropy(logits_cont_2d_t, indices)
+            loss_cont = F.cross_entropy(logits_cont_2d, indices) + F.cross_entropy(logits_cont_2d_t, indices)
         else:
             loss_cont = torch.tensor(0., device=labels.device)
 
@@ -461,7 +406,6 @@ def get_model(data_config, **kwargs):
         proj_dim=128,
         share_token=False,
         dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
-        soften=0.,  # only when >0: same-label off-diagonal entries in CLIP target matrix
         exclude=[],
         main_cont_fc_parmas=[],
         gen_cont_fc_parmas=[],
@@ -510,12 +454,7 @@ def get_model(data_config, **kwargs):
 
 def get_loss(data_config, **kwargs):
     clip_kw = kwargs.get('clip_kw')
-    return CLIPLoss(
-        clip_mode=clip_kw['mode'],
-        beta=clip_kw['beta'],
-        alpha=clip_kw['alpha'],
-        soften=clip_kw.get('soften', 0.),
-    )
+    return CLIPLoss(clip_mode=clip_kw['mode'], beta=clip_kw['beta'], alpha=clip_kw['alpha'])
 
 
 def get_train_fn(data_config, **kwargs):
@@ -650,13 +589,12 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
         if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.eval_kw
     # --- Minimal feature: dump gen-encoder vectors (used for contrastive loss) for the first N eval batches ---
     # Single-GPU use case; this is for downstream dimensionality reduction studies.
-    dump_gen_vec_max_batches = int(eval_kw.get('dump_gen_vec_max_batches', 0))
-    active = False
+    dump_gen_vec_max_batches = int(eval_kw.get('dump_gen_vec_max_batches', 10))
     dump_gen_vec_path = eval_kw.get(
         'dump_gen_vec_path',
         os.path.abspath(f'gen_encoder_vectors_eval_epoch{int(epoch):04d}_first{dump_gen_vec_max_batches}batches.txt')
     )
-    dump_gen_vec_enabled = bool(eval_kw.get('dump_gen_vec_enabled', active)) and for_training and (dump_gen_vec_max_batches > 0)
+    dump_gen_vec_enabled = bool(eval_kw.get('dump_gen_vec_enabled', True)) and for_training and (dump_gen_vec_max_batches > 0)
     dump_gen_vec_fh = None
     if dump_gen_vec_enabled:
         # overwrite per-eval call (typically per epoch)
@@ -668,7 +606,7 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
         'dump_mod_vec_path',
         os.path.abspath(f'mod_encoder_vectors_eval_epoch{int(epoch):04d}_first{dump_mod_vec_max_batches}batches.txt')
     )
-    dump_mod_vec_enabled = bool(eval_kw.get('dump_mod_vec_enabled', active)) and for_training and (dump_mod_vec_max_batches > 0)
+    dump_mod_vec_enabled = bool(eval_kw.get('dump_mod_vec_enabled', True)) and for_training and (dump_mod_vec_max_batches > 0)
     dump_mod_vec_fh = None
     if dump_mod_vec_enabled:
         dump_mod_vec_fh = open(dump_mod_vec_path, 'w', encoding='utf-8')
@@ -679,7 +617,7 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
         'dump_logits_path',
         os.path.abspath(f'logits_eval_epoch{int(epoch):04d}_first{dump_logits_max_batches}batches.txt')
     )
-    dump_logits_enabled = bool(eval_kw.get('dump_logits_enabled', active)) and for_training and (dump_logits_max_batches > 0)
+    dump_logits_enabled = bool(eval_kw.get('dump_logits_enabled', True)) and for_training and (dump_logits_max_batches > 0)
     dump_logits_fh = None
     if dump_logits_enabled:
         dump_logits_fh = open(dump_logits_path, 'w', encoding='utf-8')

@@ -29,6 +29,7 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
     在保持 ParticleTransformer2024Plus 不变的前提下，扩展一个可选功能：
     - 在经过 encoder 的自注意力堆叠（例如 8 个 blocks）后，支持两条独立的 class attention 分支，
       分别用于分类与对比学习（CLIP），而非共享一套 class attention blocks。
+    - 可选：将 label embedding 注入到用于对比学习的 class token，以增强类别条件表征。
 
     兼容性：
     - 默认行为与原版完全一致（dual_cls_blocks=False）。
@@ -41,6 +42,7 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
     def __init__(self, **kwargs) -> None:
         # 取出自定义开关，避免传递给父类
         dual_cls_blocks = kwargs.pop('dual_cls_blocks', False)
+        num_classes = kwargs.get('num_classes')
         super().__init__(**kwargs)
         self.dual_cls_blocks = dual_cls_blocks
 
@@ -59,31 +61,61 @@ class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
             self.cls_token = nn.Parameter(main_init)
             self.cls_token_aux = nn.Parameter(aux_init)
 
+        # Label embedding for injecting into contrastive cls token (when num_classes available)
+        embed_dim = self.cls_token.shape[-1] if self.cls_token is not None else None
+        if num_classes is not None and num_classes > 0 and embed_dim is not None:
+            self.label_embedding = nn.Embedding(num_classes, embed_dim)
+            nn.init.trunc_normal_(self.label_embedding.weight, std=0.02)
+        else:
+            self.label_embedding = None
+
+    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None, labels=None):
+        self._clip_labels = labels
+        return super().forward(x, v=v, mask=mask, uu=uu, uu_idx=uu_idx)
+
     def _forward_aggregator(self, x, padding_mask):
-        # 若未开启双分支，沿用原版逻辑
-        if not self.dual_cls_blocks or (self.cls_blocks is None):
+        if self.cls_blocks is None:
             return super()._forward_aggregator(x, padding_mask)
 
-        # 双分支：分别使用独立命名的两个 cls token（主/辅）
+        bsz = x.size(0)
+        labels = getattr(self, '_clip_labels', None)
+        has_label_inject = labels is not None and self.label_embedding is not None
+
+        if self.dual_cls_blocks:
+            # 双分支：主分支分类，辅分支对比学习；仅向辅分支注入 label
+            with torch.autocast('cuda', enabled=self.use_amp):
+                cls_token = self.cls_token.expand(bsz, -1, -1)
+                cls_token_aux = self.cls_token_aux.expand(bsz, -1, -1)
+                if has_label_inject:
+                    cls_token_aux = cls_token_aux + self.label_embedding(labels).unsqueeze(1)
+
+                for block in self.cls_blocks:
+                    cls_token = block(x, x_cls=cls_token, padding_mask=padding_mask)
+                if self.cls_blocks_aux is None:
+                    self.cls_blocks_aux = copy.deepcopy(self.cls_blocks)
+                for block in self.cls_blocks_aux:
+                    cls_token_aux = block(x, x_cls=cls_token_aux, padding_mask=padding_mask)
+
+                x_main = self.norm(cls_token.squeeze(1))
+                x_aux = self.norm(cls_token_aux.squeeze(1))
+            return x_main, x_aux
+
+        # 非双分支：单 token 或 num_cls_tokens>=2；向对比学习用的 token 注入
         with torch.autocast('cuda', enabled=self.use_amp):
-            bsz = x.size(0)
-            cls_token = self.cls_token.expand(bsz, -1, -1)
-            cls_token_aux = self.cls_token_aux.expand(bsz, -1, -1)
-
-            # 主分支（用于分类）：使用原有 cls_blocks
+            cls_tokens = self.cls_token.expand(bsz, -1, -1)
+            if has_label_inject:
+                lab_emb = self.label_embedding(labels).unsqueeze(1)
+                if cls_tokens.size(1) >= 2:
+                    cls_tokens = cls_tokens.clone()
+                    cls_tokens[:, 1:2, :] = cls_tokens[:, 1:2, :] + lab_emb
+                else:
+                    cls_tokens = cls_tokens + lab_emb
             for block in self.cls_blocks:
-                cls_token = block(x, x_cls=cls_token, padding_mask=padding_mask)
-
-            # 辅分支（用于对比学习）：使用独立的 cls_blocks_aux
-            if self.cls_blocks_aux is None:
-                self.cls_blocks_aux = copy.deepcopy(self.cls_blocks)
-            for block in self.cls_blocks_aux:
-                cls_token_aux = block(x, x_cls=cls_token_aux, padding_mask=padding_mask)
-
-            # 分别归一化并各自返回 (batch, embed_dim)
-            x_main = self.norm(cls_token.squeeze(1))
-            x_aux = self.norm(cls_token_aux.squeeze(1))
-        return x_main, x_aux
+                cls_tokens = block(x, x_cls=cls_tokens, padding_mask=padding_mask)
+            if cls_tokens.size(1) == 1:
+                cls_tokens = cls_tokens.squeeze(1)
+            x_cls = self.norm(cls_tokens)
+        return x_cls
 
 '''
 This code is adapted from Sophon's official repository: https://github.com/jet-universe/sophon/blob/main/networks/example_ParticleTransformer_sophon.py
@@ -185,12 +217,13 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
     def no_weight_decay(self):
         return {'mod.cls_token', 'gen.cls_token'}
 
-    def forward(self, *args):
+    def forward(self, *args, labels=None):
         '''
             args: a list of inputs, provided by the YAML card. should be:
               - points, features, lorentz_vectors, mask, gen_points, gen_features, gen_lorentz_vectors, gen_mask (for clip-only, clip-with-cls, clip-with-gencls)
               - points, features, lorentz_vectors, mask (for cls-only and clip-finetune)
               - gen_points, gen_features, gen_lorentz_vectors, gen_mask (for gencls-only)
+            labels: (batch,) optional; when provided and mod uses a dedicated contrastive token, label embedding is injected into that token.
             Output: logits, x_mod, x_gen
               - logits: (batch, num_classes), the output logits of 
                   1. main ParT if the mode has cls (clip-with-cls, cls-only, clip-finetune)
@@ -199,12 +232,18 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
               - x_mod: (batch, proj_dim), the latent features of main ParT to compute contrastive loss
               - x_gen: (batch, proj_dim), the latent features of gen ParT to compute contrastive loss
         '''
-        # return self.mod(features, v=lorentz_vectors, mask=mask) # not using the default foward implementation. Should add emport_embed flag
+        # Skip label injection when clip-with-cls + share_token=True (avoids label leakage into classification)
+        skip_label_inject = (
+            self.clip_mode == 'clip-with-cls'
+            and self.clip_share_token
+            and not getattr(self, 'dual_cls_blocks', False)
+        )
+        mod_labels = None if skip_label_inject else labels
 
         if self.clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
             points, features, lorentz_vectors, mask, gen_points, gen_features, gen_lorentz_vectors, gen_mask = args
 
-            x_mod_out = self.mod(features, v=lorentz_vectors, mask=mask)
+            x_mod_out = self.mod(features, v=lorentz_vectors, mask=mask, labels=mod_labels)
             x_gen_out = self.gen(gen_features, v=gen_lorentz_vectors, mask=gen_mask)
 
             # 工具函数：从可能的 (tensor or tuple or (bsz,2,dim)) 中取分类分支与对比分支
@@ -556,7 +595,7 @@ def train_classification_sophon_clip(
             entry_count += label.shape[0]
             opt.zero_grad()
             with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
-                logits, x_mod, x_gen = model(*inputs)
+                logits, x_mod, x_gen = model(*inputs, labels=label)
                 loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
             if grad_scaler is None:
                 loss.backward()
@@ -690,7 +729,7 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
                 inputs = [X[k].to(dev) for k in data_config.input_names]
                 label = y[data_config.label_names[0]].long().to(dev)
                 entry_count += label.shape[0]
-                logits, x_mod, x_gen = model(*inputs)
+                logits, x_mod, x_gen = model(*inputs, labels=label)
                 if loss_func is not None:
                     loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
                 else: # for test mode
@@ -896,3 +935,61 @@ def save_classification_sophon_clip(args, data_config, scores, labels, observers
         print(k, output[k])
 
     return output
+
+
+def _sanity_check_label_inject():
+    """Minimal forward/loss check for label injection under 3 configs."""
+    from types import SimpleNamespace
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    B, N, D_pf, D_gen = 2, 16, 4, 4
+    num_classes = 5
+
+    def make_data_config():
+        return SimpleNamespace(
+            input_dicts={'pf_features': ['a'] * D_pf, 'gen_features': ['b'] * D_gen},
+            input_names=['pf_points', 'pf_features', 'pf_vectors', 'pf_mask', 'gen_points', 'gen_features', 'gen_vectors', 'gen_mask'],
+            input_shapes={
+                'pf_points': (1, D_pf, N), 'pf_features': (1, D_pf, N), 'pf_vectors': (1, 4, N), 'pf_mask': (1, 1, N),
+                'gen_points': (1, D_gen, N), 'gen_features': (1, D_gen, N), 'gen_vectors': (1, 4, N), 'gen_mask': (1, 1, N),
+            },
+            label_names=['label'],
+        )
+
+    def make_inputs():
+        return [
+            torch.randn(B, D_pf, N, device=dev),
+            torch.randn(B, D_pf, N, device=dev),
+            torch.randn(B, 4, N, device=dev),
+            (torch.rand(B, 1, N, device=dev) > 0.3).float(),
+            torch.randn(B, D_gen, N, device=dev),
+            torch.randn(B, D_gen, N, device=dev),
+            torch.randn(B, 4, N, device=dev),
+            (torch.rand(B, 1, N, device=dev) > 0.3).float(),
+        ]
+
+    data_config = make_data_config()
+    loss_func = CLIPLoss(clip_mode='clip-with-cls', beta=1., alpha=1.)
+    label = torch.randint(0, num_classes, (B,), device=dev)
+
+    configs = [
+        ('clip-with-cls share_token=False dual=False', dict(num_classes=num_classes, fc_params=[(64, 0.1)], clip_kw=dict(mode='clip-with-cls', share_token=False, dual_cls_blocks=False, proj_dim=64))),
+        ('clip-with-cls dual_cls_blocks=True', dict(num_classes=num_classes, fc_params=[(64, 0.1)], clip_kw=dict(mode='clip-with-cls', share_token=False, dual_cls_blocks=True, proj_dim=64))),
+        ('clip-with-cls share_token=True (no inject)', dict(num_classes=num_classes, fc_params=[(64, 0.1)], clip_kw=dict(mode='clip-with-cls', share_token=True, dual_cls_blocks=False, proj_dim=64))),
+    ]
+    for name, kw in configs:
+        model, _ = get_model(data_config, **kw)
+        model = model.to(dev)
+        model.train()
+        inputs = make_inputs()
+        logits, x_mod, x_gen = model(*inputs, labels=label)
+        loss, lc, lcont = loss_func(logits, x_mod, x_gen, label)
+        assert bool(torch.isfinite(loss).all()), f'{name}: loss not finite'
+        assert x_mod is not None and x_mod.shape[0] == B, f'{name}: x_mod shape'
+        _logger.info('sanity_check OK: %s loss=%.4f', name, loss.item())
+    _logger.info('All label-inject sanity checks passed.')
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--sanity-check':
+        _sanity_check_label_inject()

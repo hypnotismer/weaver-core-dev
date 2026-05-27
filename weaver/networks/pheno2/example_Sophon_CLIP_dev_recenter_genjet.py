@@ -24,6 +24,102 @@ from utils.import_tools import import_module
 ParT = import_module(os.path.join(os.path.dirname(__file__), '../ParticleTransformer2024Plus.py'), 'ParT')
 
 
+# --- Gen recentering: fixed column indices for JetClassII_full_CLIP_nonscale_manual_genjet.yaml gen_features ---
+# Order: gen_pt_log, gen_e_log, gen_logptrel, gen_logerel, gen_deltaR,
+#        gen_x_tanh01, gen_y_tanh01, gen_z_tanh01, gen_t_tanh01, gen_pid, gen_aux_pid,
+#        gen_signpid, gen_isResX, gen_isResY, gen_isResDecayProd, gen_isTauDecayProd, gen_isQcdParton,
+#        gen_isU, gen_isD, gen_isS, gen_isC, gen_isB, gen_isG, gen_isEl, gen_isMu, gen_isTa,
+#        gen_isNu, gen_isHadron, gen_deta, gen_dphi
+GEN_CONTINUOUS_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29]
+GEN_PID_INDEX = 9
+GEN_AUX_PID_INDEX = 10
+GEN_AUX_DISCRETE_INDICES = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+GEN_AUX_DISCRETE_ROLE_INDICES = [12, 13, 14, 15, 16]
+GEN_AUX_DISCRETE_SPECIES_INDICES = [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+GEN_AUX_DISCRETE_SIGN_INDEX = 11
+
+
+def _build_fixed_recenter_matrix(embed_dim, feature_dim=1, seed=42):
+    """Build a fixed (non-learnable) projection matrix for recenter features -> embed_dim."""
+    g = torch.Generator().manual_seed(seed)
+    feature_mat = torch.randn(feature_dim, embed_dim, generator=g) * 0.1
+    return feature_mat
+
+
+def _build_fixed_recenter_matrices(embed_dim, species_dim=11, role_dim=5, sign_bins=3, seed=42):
+    """Build fixed (non-learnable) projection matrices for discrete aux recentering."""
+    g = torch.Generator().manual_seed(seed)
+    species_mat = torch.randn(species_dim, embed_dim, generator=g) * 0.1
+    role_mat = torch.randn(role_dim, embed_dim, generator=g) * 0.1
+    sign_mat = torch.randn(sign_bins, embed_dim, generator=g) * 0.1
+    return species_mat, role_mat, sign_mat
+
+
+def _build_fixed_qcd_bias(embed_dim, seed=314159):
+    """Build a fixed unit-norm bias vector for qcd labels."""
+    g = torch.Generator().manual_seed(seed)
+    qcd_bias = torch.randn(embed_dim, generator=g)
+    qcd_bias = F.normalize(qcd_bias.unsqueeze(0), p=2, dim=-1).squeeze(0)
+    return qcd_bias
+
+
+def compute_c_gen(gen_features, gen_mask, feature_mat, device, pid_index):
+    """
+    Compute event-level context anchor c_gen from raw recenter gen columns. No learnable params.
+    gen_features: (B, N_fts, N), gen_mask: (B, 1, N). Returns c_gen: (B, embed_dim), L2-normalized.
+    """
+    recenter_raw = gen_features[:, [pid_index], :].float()
+    feature_mat = feature_mat.to(device)
+
+    # Per-token vectors: (B, N, embed_dim)
+    d_tok = torch.einsum('bfn,fe->bne', recenter_raw, feature_mat)
+
+    # Masked mean over tokens. mask: (B, 1, N), True = valid
+    mask = gen_mask.bool().squeeze(1)  # (B, N)
+    counts = mask.float().sum(dim=1, keepdim=True).clamp(min=1e-6)
+    c_gen = (d_tok * mask.unsqueeze(-1)).sum(dim=1) / counts  # (B, embed_dim)
+
+    # L2 normalize
+    c_gen = F.normalize(c_gen, p=2, dim=-1)
+    return c_gen
+
+
+def compute_c_gen_aux(gen_features, gen_mask, species_mat, role_mat, sign_mat, device):
+    """
+    Compute event-level context anchor c_gen from aux-genpart discrete columns.
+    Matches the discrete recentering logic in example_Sophon_CLIP_dev_recenter.py.
+    """
+    disc = gen_features[:, GEN_AUX_DISCRETE_INDICES, :]
+    role_raw = disc[:, 1:6, :].float()
+    species_raw = disc[:, 6:17, :].float()
+    sign_raw = disc[:, 0, :].float()
+
+    role_raw = (role_raw > 0.5).float()
+    species_raw = (species_raw > 0.5).float()
+    sign_idx = (torch.sign(sign_raw) + 1).long().clamp(0, 2)
+
+    species_mat = species_mat.to(device)
+    role_mat = role_mat.to(device)
+    sign_mat = sign_mat.to(device)
+
+    d_species = torch.einsum('bdn,de->bne', species_raw, species_mat)
+    d_role = torch.einsum('bdn,de->bne', role_raw, role_mat)
+    d_sign = sign_mat[sign_idx]
+    d_tok = d_species + d_role + d_sign
+
+    mask = gen_mask.bool().squeeze(1)
+    counts = mask.float().sum(dim=1, keepdim=True).clamp(min=1e-6)
+    c_gen = (d_tok * mask.unsqueeze(-1)).sum(dim=1) / counts
+    c_gen = F.normalize(c_gen, p=2, dim=-1)
+    return c_gen
+
+
+def split_gen_features(gen_features):
+    """Split gen_features into encoder input (continuous + token-type columns)."""
+    cont = gen_features[:, GEN_CONTINUOUS_INDICES, :]  # (B, len(GEN_CONTINUOUS_INDICES), N)
+    return cont
+
+
 class ParticleTransformer_dual_cls(ParT.ParticleTransformer):
     """
     在保持 ParticleTransformer2024Plus 不变的前提下，扩展一个可选功能：
@@ -118,6 +214,20 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
         clip_kw = kwargs.pop('clip_kw')
         self.clip_mode = clip_kw['mode']
         self.clip_share_token = clip_kw['share_token']
+        self.recenter_gamma1 = float(clip_kw.get('gamma1', 1.0))
+        self.recenter_gamma2 = float(clip_kw.get('gamma2', 1.0))
+        self.recenter_gamma_qcd = float(clip_kw.get('gamma_qcd', 0.0))
+        self.use_aux_genpart_pid = bool(clip_kw.get('use_aux_genpart_pid', False))
+        self._recenter_pid_index = GEN_PID_INDEX
+
+        def init_recenter_buffers(embed_dim):
+            fm = _build_fixed_recenter_matrix(embed_dim)
+            sm, rm, sgm = _build_fixed_recenter_matrices(embed_dim)
+            self.register_buffer('_recenter_feature_mat', fm)
+            self.register_buffer('_recenter_species_mat', sm)
+            self.register_buffer('_recenter_role_mat', rm)
+            self.register_buffer('_recenter_sign_mat', sgm)
+            self.register_buffer('_recenter_qcd_bias', _build_fixed_qcd_bias(embed_dim))
 
         assert self.clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls', 'clip-finetune', 'cls-only', 'gencls-only'], 'Invalid mode %s' % self.clip_mode
         if self.clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
@@ -144,6 +254,9 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
             # 标记 dual 是否启用，便于 forward 中无视 share_token
             self.dual_cls_blocks = clip_kw.get('dual_cls_blocks', False) if self.clip_mode == 'clip-with-cls' else False
+
+            # Gen recentering: fixed (non-learnable) projection matrix for raw recenter features -> embed_dim
+            init_recenter_buffers(gen_model_kw['embed_dims'][-1])
 
             # define outer FCs
             self.mod_proj = FFN(input_dim=kwargs['embed_dims'][-1], output_dim=clip_kw['proj_dim'], fc_params=clip_kw['main_cont_fc_parmas'], bias_last=False)
@@ -180,12 +293,64 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
         elif self.clip_mode in ['gencls-only']:
             self.gen = ParticleTransformer_dual_cls(**gen_model_kw)
+            init_recenter_buffers(gen_model_kw['embed_dims'][-1])
 
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'mod.cls_token', 'gen.cls_token'}
 
-    def forward(self, *args):
+    def _get_gen_input_cls_token(self, batch_size):
+        """Expose the gen cls token exactly as the input to cls_blocks."""
+        assert self.gen.cls_token is not None, 'gen cls token is unavailable when num_cls_layers=0'
+        return self.gen.cls_token.expand(batch_size, -1, -1)
+
+    def _get_qcd_event_mask(self, labels, device):
+        if labels is None:
+            return None
+        labels = labels.to(device=device)
+        return ((labels >= 161) & (labels <= 187)).to(dtype=self._recenter_qcd_bias.dtype)
+
+    def _compute_recenter_anchor(self, gen_features, gen_mask, labels=None):
+        if self.use_aux_genpart_pid:
+            c_gen = compute_c_gen_aux(
+                gen_features, gen_mask,
+                self._recenter_species_mat, self._recenter_role_mat, self._recenter_sign_mat,
+                gen_features.device,
+            )
+        else:
+            c_gen = compute_c_gen(
+                gen_features, gen_mask,
+                self._recenter_feature_mat,
+                gen_features.device,
+                self._recenter_pid_index,
+            )
+        if self.clip_mode in ['clip-only', 'clip-with-cls'] and self.recenter_gamma_qcd != 0.0:
+            qcd_mask = self._get_qcd_event_mask(labels, gen_features.device)
+            if qcd_mask is not None:
+                c_gen = c_gen + self.recenter_gamma_qcd * qcd_mask.unsqueeze(-1) * self._recenter_qcd_bias.unsqueeze(0)
+        return c_gen
+
+    def _forward_gen_recentered(self, gen_features, gen_lorentz_vectors, gen_mask, labels=None):
+        """Gen path: encoder features -> encoder -> recenter -> aggregator -> (B, embed_dim)."""
+        gen_cont = split_gen_features(gen_features)
+        x, padding_mask = self.gen._forward_encoder(gen_cont, v=gen_lorentz_vectors, mask=gen_mask)
+        c_gen = self._compute_recenter_anchor(gen_features, gen_mask, labels=labels)
+        x = x - self.recenter_gamma1 * c_gen[:, None, :]
+        if self.clip_mode == 'clip-with-cls' and self.gen.cls_blocks is not None:
+            with torch.autocast('cuda', enabled=self.gen.use_amp):
+                # This x_cls is the exact cls token fed into cls_blocks.
+                x_cls = self._get_gen_input_cls_token(x.size(0))
+                x_cls = x_cls - self.recenter_gamma2 * c_gen[:, None, :]
+                for block in self.gen.cls_blocks:
+                    x_cls = block(x, x_cls=x_cls, padding_mask=padding_mask)
+                if x_cls.size(1) == 1:
+                    x_cls = x_cls.squeeze(1)
+                x_cls = self.gen.norm(x_cls)
+        else:
+            x_cls = self.gen._forward_aggregator(x, padding_mask)
+        return x_cls
+
+    def forward(self, *args, labels=None):
         '''
             args: a list of inputs, provided by the YAML card. should be:
               - points, features, lorentz_vectors, mask, gen_points, gen_features, gen_lorentz_vectors, gen_mask (for clip-only, clip-with-cls, clip-with-gencls)
@@ -205,7 +370,7 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
             points, features, lorentz_vectors, mask, gen_points, gen_features, gen_lorentz_vectors, gen_mask = args
 
             x_mod_out = self.mod(features, v=lorentz_vectors, mask=mask)
-            x_gen_out = self.gen(gen_features, v=gen_lorentz_vectors, mask=gen_mask)
+            x_gen_out = self._forward_gen_recentered(gen_features, gen_lorentz_vectors, gen_mask, labels=labels)
 
             # 工具函数：从可能的 (tensor or tuple or (bsz,2,dim)) 中取分类分支与对比分支
             def split_outputs(x):
@@ -319,7 +484,9 @@ class ParticleTransformerSophonCLIPWrapper(torch.nn.Module):
 
         elif self.clip_mode in ['gencls-only']:
             gen_points, gen_features, gen_lorentz_vectors, gen_mask = args
-            logits = self.gen(gen_features, v=gen_lorentz_vectors, mask=gen_mask)
+            x_gen_cls = self._forward_gen_recentered(gen_features, gen_lorentz_vectors, gen_mask)
+            assert self.gen.fc is not None, 'gencls-only requires gen_model_kw.fc_params'
+            logits = self.gen.fc(x_gen_cls)
             x_mod = None
             x_gen = None
 
@@ -438,7 +605,7 @@ def get_model(data_config, **kwargs):
         clip_kw=dict()
     )
     cfg['gen_model_kw'].update(
-        input_dim=len(data_config.input_dicts.get('gen_features', [])),
+        input_dim=len(GEN_CONTINUOUS_INDICES),  # pid is reserved for recentering; other columns are fed to the encoder
         num_classes=None,
         # network configurations
         pair_input_dim=4,
@@ -461,6 +628,10 @@ def get_model(data_config, **kwargs):
         proj_dim=128,
         share_token=False,
         dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
+        gamma1=1.0,  # scale for subtracting c_gen from encoder output tokens x
+        gamma2=1.0,  # scale for subtracting c_gen from the input cls token x_cls
+        gamma_qcd=0.0,  # extra fixed qcd bias added onto c_gen for labels 161..187
+        use_aux_genpart_pid=False,  # if True, c_gen uses the discrete aux-genpart recenter logic from example_Sophon_CLIP_dev_recenter.py
         soften=0.,  # only when >0: same-label off-diagonal entries in CLIP target matrix
         exclude=[],
         main_cont_fc_parmas=[],
@@ -485,6 +656,9 @@ def get_model(data_config, **kwargs):
     # 在 clip-with-cls 模式下，dual_cls_blocks 完全由 clip_kw 控制；若未提供则默认 False
     if cfg['clip_kw']['mode'] == 'clip-with-cls':
         cfg['clip_kw']['dual_cls_blocks'] = cfg['clip_kw'].get('dual_cls_blocks', False)
+
+    # Gen recentering: force gen input_dim to encoder-visible columns (raw pid stays in recenter only)
+    cfg['gen_model_kw']['input_dim'] = len(GEN_CONTINUOUS_INDICES)
 
     _logger.info('Model config: %s' % str(cfg))
 
@@ -556,7 +730,7 @@ def train_classification_sophon_clip(
             entry_count += label.shape[0]
             opt.zero_grad()
             with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
-                logits, x_mod, x_gen = model(*inputs)
+                logits, x_mod, x_gen = model(*inputs, labels=label)
                 loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
             if grad_scaler is None:
                 loss.backward()
@@ -630,6 +804,7 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
                             eval_metrics=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix'],
                             tb_helper=None, extra_args=None):
     model.eval()
+    net = model.module if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model
 
     data_config = test_loader.dataset.config
 
@@ -646,12 +821,12 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
     labels_counts = []
     observers = defaultdict(list)
     start_time = time.time()
-    eval_kw = model.module.eval_kw \
-        if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.eval_kw
+    eval_kw = net.eval_kw
     # --- Minimal feature: dump gen-encoder vectors (used for contrastive loss) for the first N eval batches ---
     # Single-GPU use case; this is for downstream dimensionality reduction studies.
-    dump_gen_vec_max_batches = int(eval_kw.get('dump_gen_vec_max_batches', 0))
-    active = False
+    dump_gen_vec_max_batches = int(eval_kw.get('dump_gen_vec_max_batches', 10))
+    #test gen output
+    active = True
     dump_gen_vec_path = eval_kw.get(
         'dump_gen_vec_path',
         os.path.abspath(f'gen_encoder_vectors_eval_epoch{int(epoch):04d}_first{dump_gen_vec_max_batches}batches.txt')
@@ -661,6 +836,18 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
     if dump_gen_vec_enabled:
         # overwrite per-eval call (typically per epoch)
         dump_gen_vec_fh = open(dump_gen_vec_path, 'w', encoding='utf-8')
+
+    # --- Minimal feature: dump c_gen vectors (recenter anchors) for the first N eval batches ---
+    dump_c_gen_max_batches = int(eval_kw.get('dump_c_gen_max_batches', dump_gen_vec_max_batches))
+    dump_c_gen_path = eval_kw.get(
+        'dump_c_gen_path',
+        os.path.abspath(f'c_gen_vectors_eval_epoch{int(epoch):04d}_first{dump_c_gen_max_batches}batches.txt')
+    )
+    dump_c_gen_supported = hasattr(net, '_recenter_feature_mat')
+    dump_c_gen_enabled = bool(eval_kw.get('dump_c_gen_enabled', active)) and for_training and (dump_c_gen_max_batches > 0) and dump_c_gen_supported
+    dump_c_gen_fh = None
+    if dump_c_gen_enabled:
+        dump_c_gen_fh = open(dump_c_gen_path, 'w', encoding='utf-8')
 
     # --- Minimal feature: dump x_mod vectors (used for contrastive loss) for the first N eval batches ---
     dump_mod_vec_max_batches = int(eval_kw.get('dump_mod_vec_max_batches', dump_gen_vec_max_batches))
@@ -690,7 +877,7 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
                 inputs = [X[k].to(dev) for k in data_config.input_names]
                 label = y[data_config.label_names[0]].long().to(dev)
                 entry_count += label.shape[0]
-                logits, x_mod, x_gen = model(*inputs)
+                logits, x_mod, x_gen = model(*inputs, labels=label)
                 if loss_func is not None:
                     loss, loss_cls, loss_cont = loss_func(logits, x_mod, x_gen, label)
                 else: # for test mode
@@ -702,6 +889,16 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
                     label_cpu = label.detach().cpu().numpy()
                     for lb, vec in zip(label_cpu, x_gen_cpu):
                         dump_gen_vec_fh.write(str(int(lb)) + "\t" + " ".join(f"{v:.6e}" for v in vec.tolist()) + "\n")
+
+                # Dump c_gen vectors for the first N batches (each line: "<label>\t<vec0> <vec1> ...")
+                if dump_c_gen_fh is not None and num_batches < dump_c_gen_max_batches and ('gen_features' in X) and ('gen_mask' in X):
+                    gen_features = X['gen_features'].to(dev)
+                    gen_mask = X['gen_mask'].to(dev)
+                    c_gen = net._compute_recenter_anchor(gen_features, gen_mask, labels=label)
+                    c_gen_cpu = c_gen.detach().float().cpu().numpy()
+                    label_cpu = label.detach().cpu().numpy()
+                    for lb, vec in zip(label_cpu, c_gen_cpu):
+                        dump_c_gen_fh.write(str(int(lb)) + "\t" + " ".join(f"{v:.6e}" for v in vec.tolist()) + "\n")
 
                 # Dump mod vectors for the first N batches (each line: "<label>\t<vec0> <vec1> ...")
                 if dump_mod_vec_fh is not None and num_batches < dump_mod_vec_max_batches and (x_mod is not None):
@@ -765,6 +962,9 @@ def evaluate_classification_sophon_clip(model, test_loader, dev, epoch, for_trai
     if dump_gen_vec_fh is not None:
         dump_gen_vec_fh.close()
         _logger.info('Dumped gen encoder vectors for first %d eval batches to %s', dump_gen_vec_max_batches, dump_gen_vec_path)
+    if dump_c_gen_fh is not None:
+        dump_c_gen_fh.close()
+        _logger.info('Dumped c_gen vectors for first %d eval batches to %s', dump_c_gen_max_batches, dump_c_gen_path)
     if dump_mod_vec_fh is not None:
         dump_mod_vec_fh.close()
         _logger.info('Dumped mod encoder vectors for first %d eval batches to %s', dump_mod_vec_max_batches, dump_mod_vec_path)

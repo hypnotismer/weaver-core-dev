@@ -259,14 +259,16 @@ def evaluate_classification_sophon(model, test_loader, dev, epoch, for_training=
         scores_dict = {
             'Xbb': scores[:, 0],
             'Xcc': scores[:, 1],
+            'XYYqqqq': scores[:, 63],
             'QCD': np.sum(scores[:, 161:188], axis=1), # sum of the last 27 scores to form the QCD score
         }
         flag_dict = {
             'Xbb': labels['truth_label'] == 0,
             'Xcc': labels['truth_label'] == 1,
+            'XYYqqqq': labels['truth_label'] == 63,
             'QCD': (labels['truth_label'] >= 161) & (labels['truth_label'] < 188),
         }
-        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb')] # ROC curves for A vs B
+        comp_list = [('Xbb', 'QCD'), ('Xcc', 'QCD'), ('Xcc', 'Xbb'), ('XYYqqqq', 'QCD')] # ROC curves for A vs B
         bkgrej = {}
 
         f, ax = plt.subplots(figsize=(5, 5))

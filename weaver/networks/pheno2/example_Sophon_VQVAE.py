@@ -55,6 +55,9 @@ class ParticleTransformerSophonVQVAEWrapper(nn.Module):
         self.loss_pf_align_weight = vq_kw.get('loss_pf_align_weight', 1.0)
         self.entropy_reg = vq_kw.get('entropy_reg', 0.0)
         self.kmeans_warmup_steps = int(vq_kw.get('kmeans_warmup_steps', 0) or 0)
+        # If enabled, keep gen/gen_proj trainable during the VQ kmeans warmup forward passes,
+        # then freeze them right after warmup so subsequent training only updates the codebook.
+        self.freeze_gen_after_kmeans_warmup = bool(vq_kw.get('freeze_gen_after_kmeans_warmup', False))
 
         # 关闭内置 FC，改用外部头
         fc_params = kwargs.get('fc_params', None)
@@ -103,6 +106,13 @@ class ParticleTransformerSophonVQVAEWrapper(nn.Module):
             dim=vq_kw.get('dim', -1),
             code_vector_size=vq_kw.get('code_vector_size', None),
         )
+
+    def freeze_gen_branch_(self):
+        """Freeze gen encoder branch (gen + gen_proj). Safe to call mid-training."""
+        for p in self.gen.parameters():
+            p.requires_grad = False
+        for p in self.gen_proj.parameters():
+            p.requires_grad = False
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -318,6 +328,8 @@ def get_model(data_config, **kwargs):
         dim=-1,
         code_vector_size=None,
         vq_loss_update_freq=4,
+        # If true, freeze gen/gen_proj right after kmeans warmup.
+        freeze_gen_after_kmeans_warmup=False,
         # kmeans_init warmup: run a few no-grad forward passes on random-initialized model
         # so vqtorch can initialize the codebook from the latent distribution.
         kmeans_warmup_steps=0,
@@ -430,6 +442,10 @@ def train_classification_vqvae(
                         _m(*inputs, labels=label)
                 _m.train(prev_mode)
                 _m._vq_kmeans_warmup_done = True
+                # Optionally freeze gen branch after kmeans warmup so training updates only the codebook.
+                if getattr(_m, 'freeze_gen_after_kmeans_warmup', False):
+                    _m.freeze_gen_branch_()
+                    _logger.info('Froze gen/gen_proj right after kmeans warmup (codebook-only training).')
             # sync codebook (and any buffers) across ranks
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
@@ -452,13 +468,18 @@ def train_classification_vqvae(
                 loss, loss_cls, loss_vq, loss_pf_align, loss_gen_align, loss_entropy = loss_func(
                     logits, vq_out, label, step=batch_idx
                 )
-            if grad_scaler is None:
-                loss.backward()
-                opt.step()
-            else:
-                grad_scaler.scale(loss).backward()
-                grad_scaler.step(opt)
-                grad_scaler.update()
+            # When all trainable parameters are frozen (e.g., codebook-only EMA updates),
+            # loss may not require grad; skip backward/step in that case.
+            if loss.requires_grad:
+                if grad_scaler is None:
+                    loss.backward()
+                    opt.step()
+                else:
+                    grad_scaler.scale(loss).backward()
+                    grad_scaler.step(opt)
+                    grad_scaler.update()
+            elif batch_idx == 0:
+                _logger.warning('Loss has no grad; skipped backward/optimizer step (likely all params frozen).')
 
             if scheduler and getattr(scheduler, '_update_per_step', False):
                 scheduler.step()
