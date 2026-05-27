@@ -331,13 +331,15 @@ class CLIPLoss(torch.nn.Module):
         Computes the CLIP loss and classification loss
     '''
 
-    def __init__(self, clip_mode=None, beta=1., alpha=1., soften=0.):
+    def __init__(self, clip_mode=None, beta=1., alpha=1., soften=0., softenqcd=0.):
         super().__init__()
         self.clip_mode = clip_mode
         self.beta = beta
         self.alpha = alpha
         self.soften = float(soften)
+        self.softenqcd = float(softenqcd)
         assert 0. <= self.soften <= 1., 'soften must be in [0, 1], got %s' % str(self.soften)
+        assert 0. <= self.softenqcd <= 1., 'softenqcd must be in [0, 1], got %s' % str(self.softenqcd)
         if clip_mode in ['clip-only', 'clip-with-cls', 'clip-with-gencls']:
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -389,10 +391,18 @@ class CLIPLoss(torch.nn.Module):
                             float(logit_scale.detach().item()),
                         )
 
-            if self.soften > 0.:
-                # soft target matrix: diagonal=1, same-label off-diagonal=soften, then row-normalize.
+            if self.soften > 0. or self.softenqcd > 0.:
+                # soft target matrix: diagonal=1, selected same-label off-diagonal=soften, then row-normalize.
                 same_label = labels.view(-1, 1).eq(labels.view(1, -1))
                 target = same_label.to(dtype=logits_cont_2d.dtype) * self.soften
+                if self.softenqcd > 0.:
+                    qcd_label = labels.ge(161) & labels.lt(188)
+                    same_qcd_label = same_label & qcd_label.view(-1, 1) & qcd_label.view(1, -1)
+                    target = torch.where(
+                        same_qcd_label,
+                        torch.full_like(target, self.softenqcd),
+                        target,
+                    )
                 target.fill_diagonal_(1.)
                 target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
@@ -462,6 +472,7 @@ def get_model(data_config, **kwargs):
         share_token=False,
         dual_cls_blocks=False,  # 开关放到 clip_kw 中，仅在 clip-with-cls 模式下生效
         soften=0.,  # only when >0: same-label off-diagonal entries in CLIP target matrix
+        softenqcd=0.,  # only when >0: same-label softening for labels in range(161, 188)
         exclude=[],
         main_cont_fc_parmas=[],
         gen_cont_fc_parmas=[],
@@ -515,6 +526,7 @@ def get_loss(data_config, **kwargs):
         beta=clip_kw['beta'],
         alpha=clip_kw['alpha'],
         soften=clip_kw.get('soften', 0.),
+        softenqcd=clip_kw.get('softenqcd', 0.),
     )
 
 
