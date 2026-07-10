@@ -6,23 +6,19 @@
 selection: >-
     (jet_tightId==1) & (jet_no<2) & (fj_pt>200) & (fj_pt<2500) & (fj_sdmass>=20) & (fj_sdmass<260) & (ak.num(cpfcandlt_px) + ak.num(npfcand_px) > 0) &
     (
+      ((fj_label==24) & (event_no%7!=0)) |
       ((fj_label==314) & (event_no%7!=0)) |
       ((fj_label >= 0) & (fj_label <= 16) & (event_no%7!=0)) |
       ((fj_label >= 309) & (fj_label < 314) & (event_no%7!=0))
     )
 ### selection to apply at test time (i.e., when running w/ --predict)
-# infer samples with event_label (fileio hack): no event_no%7 cut, no fj_label cut
-# other infer samples (xgg/xggg/top/qcd, event_label==0): keep event_no%7==0 and fj_label selection
 test_time_selection: >-
     (jet_tightId==1) & (jet_no<2) &
     (
-      (event_label != 0) |
-      (
-        (((fj_label==314) & (event_no%7==0)) |
-          ((fj_label >= 0) & (fj_label <= 16) & (event_no%7==0)) |
-          ((fj_label >= 309) & (fj_label < 314) & (event_no%7==0))) &
-        (event_label==0)
-      )
+      ((fj_label==24) & (event_no%7==0)) |
+      ((fj_label==314) & (event_no%7==0)) |
+      ((fj_label >= 0) & (fj_label <= 16) & (event_no%7==0)) |
+      ((fj_label >= 309) & (fj_label < 314) & (event_no%7==0))
     )
 
 new_variables:
@@ -76,6 +72,7 @@ new_variables:
     fj_eta_fake: ak.ones_like(fj_eta)
     # xggg is inserted after the previous QCD labels; factor labels are shifted by +1 in these samples.
     label_xggg: (fj_label == 314)
+    label_xgg: (fj_label == 24)
     label_top: ((fj_label >= 0) & (fj_label <= 16))
     label_qcd: ((fj_label >= 309) & (fj_label < 314))
 
@@ -204,6 +201,7 @@ labels:
     type: simple
     value: [
         label_xggg,
+        label_xgg,
         label_top,
         label_qcd
         ]
@@ -257,11 +255,13 @@ weights:
     reweight_classes:
         [
             label_xggg,
+            label_xgg,
             label_top,
             label_qcd
         ]
     class_weights:
       [
+        1,
         1,
         1,
         1

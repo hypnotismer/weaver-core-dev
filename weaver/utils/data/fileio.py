@@ -271,7 +271,8 @@ def _read_root(filepath, branches, load_range=None, treename=None):
         "'WJetsToLNu_Pt-400To600_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 5000},
         "'WJetsToLNu_Pt-250To400_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 4000},
         "'WJetsToLNu_Pt-100To250_MatchEWPDG20_TuneCP5_13TeV-amcatnloFXFX-pythia8_infer' in filepath": {'event_label': 3000},
-        "'BulkGravitonToHHTo4QGluLTau_MX-Var_MH-15to250_LowPt' in filepath": {'event_label': 1000}
+        "'WZR_012j_NLO_WToLNu_100_infer' in filepath": {'event_label': 1000},
+        "'WZR_012j_NLO_WToLNu_ZRTo3Glu_M-250_13TeV-pythia8_infer' in filepath": {'event_label': 1000},
     }
     specific_vars_included = {}
     
@@ -279,15 +280,16 @@ def _read_root(filepath, branches, load_range=None, treename=None):
     #specific_vars_included = {}
 
     def remove_branch(branches, filepath):
-        for expr, new_branch_dict in specific_vars.items():
-            if eval(expr):
-                branches = list(set(branches) - set(new_branch_dict.keys()))
+        hack_branches = set()
+        for new_branch_dict in specific_vars.values():
+            hack_branches.update(new_branch_dict.keys())
+        branches = list(set(branches) - (hack_branches & set(branches)))
         for expr, new_branch_list in specific_vars_included.items():
             if eval(expr):
                 branches = list(set(branches) | set(new_branch_list))
         return branches
 
-    def add_new_branch(outputs, filepath, nent):
+    def add_new_branch(outputs, filepath, nent, requested_branches):
         for expr, new_branch_dict in specific_vars.items():
             if eval(expr):
                 for b, v in new_branch_dict.items():
@@ -295,6 +297,8 @@ def _read_root(filepath, branches, load_range=None, treename=None):
                         outputs[b] = np.zeros(nent, dtype=type(v)) + v
                     elif isinstance(v, str):
                         outputs[b] = ak.values_astype(ak.numexpr.evaluate(v, outputs), np.float32)
+        if 'event_label' in requested_branches and 'event_label' not in outputs.fields:
+            outputs['event_label'] = np.zeros(nent, dtype=np.int32)
 
     _branches = branches.copy()
     _branches = remove_branch(_branches, filepath)
@@ -329,7 +333,7 @@ def _read_root(filepath, branches, load_range=None, treename=None):
         outputs = tree.arrays(filter_name=_branches, entry_start=start, entry_stop=stop)
 
     nent = len(outputs)
-    add_new_branch(outputs, filepath, nent)
+    add_new_branch(outputs, filepath, nent, branches)
     # print('//', filepath, ak.fields(outputs))
 
     return outputs
