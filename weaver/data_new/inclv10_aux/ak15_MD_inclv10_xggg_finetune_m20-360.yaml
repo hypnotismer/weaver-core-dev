@@ -223,6 +223,7 @@ observers:
     - fj_genjet_nomu_sdmass
     - jet_pt
     - jet_corr_pt
+    - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_visiableMassCorr
     - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probHgg
     - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWcs
     - pfMassDecorrelatedInclParticleTransformerAK15V2JetTags_probTopWev
