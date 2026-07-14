@@ -201,12 +201,11 @@ inputs:
 
 labels:
     ### type can be `simple`, `custom`, 'hybrid'
-    type: simple
-    value: [
-        label_xggg,
-        label_top,
-        label_qcd
-        ]
+    type: custom
+    value:
+        truth_label: np.argmax(np.stack([label_xggg, label_top, label_qcd], axis=1), axis=1)
+        target_res_mass_factor: np.where(label_qcd, fj_genjet_sdmass, fj_gen_mass) / np.maximum(fj_mass, 1e-6)
+        target_parts_mass_factor: np.where(label_qcd, fj_genjet_nomu_sdmass, fj_genparts_mass) / np.maximum(fj_mass, 1e-6)
 
 
 observers:
