@@ -269,6 +269,10 @@ weights:
     # main classes: ref -> constant hist (approx flat); label_sculpt omitted from hist_ref -> unit weights (natural spectrum)
     use_precomputed_weights: false
     reweight_method: ref
+    # Preserve the requested 1:1:1:1 sampled class ratio. The sampler treats
+    # weights >=1 as probability 1, so percentile normalization would saturate
+    # large xsec weights and distort the actual sculpt fraction.
+    reweight_normalize_max: true
     reweight_vars:
         fj_pt: [200, 251, 316, 398, 501, 630, 793, 997, 1255, 1579, 1987, 2500]
         fj_sdmass: [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 310, 320, 330, 340, 350, 360]

@@ -320,9 +320,19 @@ class WeightMaker(object):
             if table is None:
                 raise RuntimeError('Chunked WeightMaker does not support `reweight_basewgt` yet.')
             wgts = _build_weights(table, self._data_config, reweight_hists=result)
-            wgt_ref = np.percentile(wgts, 100 - self._data_config.reweight_threshold)
-            _logger.info('Set overall reweighting scale factor (%d threshold) to %s (max %s)' %
-                         (100 - self._data_config.reweight_threshold, wgt_ref, np.max(wgts)))
+            if self._data_config.reweight_normalize_max:
+                # The sampler implements acceptance with rand < weight, so weights > 1
+                # saturate and no longer preserve the class proportions set above.
+                # Keep every runtime weight <= max_weight to retain those proportions.
+                wgt_ref = np.max(wgts) / max_weight
+                _logger.info(
+                    'Set overall reweighting scale factor from max weight to %s '
+                    '(max runtime weight after scaling: %s)',
+                    wgt_ref, max_weight)
+            else:
+                wgt_ref = np.percentile(wgts, 100 - self._data_config.reweight_threshold)
+                _logger.info('Set overall reweighting scale factor (%d threshold) to %s (max %s)' %
+                             (100 - self._data_config.reweight_threshold, wgt_ref, np.max(wgts)))
             for label in self._data_config.reweight_classes:
                 result[label] /= wgt_ref
 
