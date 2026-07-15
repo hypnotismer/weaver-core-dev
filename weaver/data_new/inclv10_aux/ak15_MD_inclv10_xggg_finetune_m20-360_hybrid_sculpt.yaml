@@ -3,14 +3,14 @@
 
 ## == NOTE for non-MD training ==
 ## should always require event_no%7!=0
-## sculpt yaml: AN ttbar/wjets via event_label>=2000; test_time_selection unchanged
+## sculpt yaml: AN ttbar/wjets via event_label>=2000; sculpt train only fj_sdmass>=180; test_time_selection unchanged
 selection: >-
     (jet_tightId==1) & (jet_no<2) & (fj_pt>200) & (fj_pt<2500) & (fj_sdmass>=20) & (fj_sdmass<360) & (ak.num(cpfcandlt_px) + ak.num(npfcand_px) > 0) &
     (
       ((fj_label==314) & (event_label < 2000) & (event_no%7!=0)) |
       ((fj_label >= 0) & (fj_label <= 16) & (event_label < 2000) & (event_no%7!=0)) |
       ((fj_label >= 309) & (fj_label < 314) & (event_label < 2000) & (event_no%7!=0)) |
-      ((event_label >= 2000) & (event_no%7!=0))
+      ((event_label >= 2000) & (fj_sdmass >= 180) & (event_no%7!=0))
     )
 ### selection to apply at test time (i.e., when running w/ --predict)
 # infer samples with event_label (fileio hack): no event_no%7 cut, no fj_label cut
@@ -77,12 +77,12 @@ new_variables:
     fj_mass_log: ak.ones_like(fj_mass)
     fj_eta_fake: ak.ones_like(fj_eta)
     # xggg is inserted after the previous QCD labels; factor labels are shifted by +1 in these samples.
-    # sculpt AN bkg: event_label>=2000 (ttbar/wjets); main classes require event_label<2000
-    label_sculpt: (event_label >= 2000)
+    # sculpt AN bkg: event_label>=2000 (ttbar/wjets) and high sdmass; main classes require event_label<2000
+    label_sculpt: (event_label >= 2000) & (fj_sdmass >= 180)
     label_xggg: (fj_label == 314) & (event_label < 2000)
     label_top: ((fj_label >= 0) & (fj_label <= 16)) & (event_label < 2000)
     label_qcd: ((fj_label >= 309) & (fj_label < 314)) & (event_label < 2000)
-    is_sculpt: (event_label >= 2000)
+    is_sculpt: (event_label >= 2000) & (fj_sdmass >= 180)
 
 preprocess:
     ### method: [manual, auto] - whether to use manually specified parameters for variable standardization

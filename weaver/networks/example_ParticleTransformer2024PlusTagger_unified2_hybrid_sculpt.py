@@ -27,7 +27,8 @@ DEFAULT_SCULPT_KW = {
     'tau': 0.05,
     'pass_fracs': [0.70, 0.50, 0.30],  # bkg rej 30/50/70%
     'score_index': 0,  # label_xggg
-    'mass_bins': list(range(20, 361, 10)),
+    # Only flatten high-mass bins (severe sculpting region); WP/eff0 still use all sculpt events.
+    'mass_bins': list(range(180, 361, 10)),
     'mass_source': 'finetune_parts',  # soft/hard sculpt on finetune parts reg mass
     'reg_index': 1,  # preds_reg[:,1] == target_parts_mass_factor
 }
@@ -67,7 +68,7 @@ def soft_sculpt_loss(logits, mass, is_sculpt, sculpt_kw):
     score_index = int(sculpt_kw.get('score_index', 0))
     tau = float(sculpt_kw.get('tau', 0.05))
     pass_fracs = sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30])
-    mass_bins = sculpt_kw.get('mass_bins', list(range(20, 361, 10)))
+    mass_bins = sculpt_kw.get('mass_bins', list(range(180, 361, 10)))
 
     s = torch.softmax(logits, dim=-1)[:, score_index]
     s_m = s[mask]
@@ -978,7 +979,7 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
         mae_dict = hard_sculpt_mae(
             s_all, m_all,
             sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
-            sculpt_kw.get('mass_bins', list(range(20, 361, 10))),
+            sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
         )
         for k, v in mae_dict.items():
             _logger.info('SculptMAE/val_%s (finetune_parts_regmass): %.5f (n_sculpt=%d)', k, v, len(s_all))
@@ -1298,7 +1299,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
         mae_dict = hard_sculpt_mae(
             s_all, m_all,
             sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
-            sculpt_kw.get('mass_bins', list(range(20, 361, 10))),
+            sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
         )
         for k, v in mae_dict.items():
             _logger.info('SculptMAE/val_%s (finetune_parts_regmass): %.5f (n_sculpt=%d)', k, v, len(s_all))
