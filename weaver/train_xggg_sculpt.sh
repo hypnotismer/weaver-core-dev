@@ -11,11 +11,12 @@ regexmatch='^(?!(main|module\.main)\.).*' # match the parameters that do not sta
 #--freeze-model-weights $freeze --start-lr 1e-3 \
 #--optimizer-option lr_mult (\"$regexmatch\",1000) --start-lr 1e-6 \
 #'target_reg_inds':[314,315]
-# sculpt_kw: soft AN sculpting loss (ttbar/wjets); val logs hard SculptMAE
+# sculpt_kw: soft AN sculpting on finetune parts reg mass; val logs hard SculptMAE
+# NOTE: yaml monitor_variables changed -> re-run: bash gen_yaml_auto.sh (or REMAKE_AUTO=1)
 modelhybridftopts="--network-config networks/example_ParticleTransformer2024PlusTagger_unified2_hybrid_sculpt.py \
 -o finetune_kw {'freeze_main_params':False,'mode':'hybrid','target_inds':None,'target_reg_inds':None,'num_ft_nodes':5,'num_ft_cls_nodes':3,'num_ft_reg_nodes':2,'fc_params':[(512,0.1),(512,0.1)],'fc_suff_kw':{'append_after':'fc.0','params':[(512,0.1),(512,0.1)]}} \
 -o label_cls_nodes ['label_xggg','label_top','label_qcd'] -o label_stored ['label_xggg','label_top','label_qcd'] \
--o sculpt_kw {'enable':True,'lambda':1.0,'tau':0.05,'pass_fracs':[0.70,0.50,0.30],'score_index':0,'mass_bins':[20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200,210,220,230,240,250,260,270,280,290,300,310,320,330,340,350,360]} \
+-o sculpt_kw {'enable':True,'lambda':1.0,'tau':0.05,'pass_fracs':[0.70,0.50,0.30],'score_index':0,'mass_source':'finetune_parts','reg_index':1,'mass_bins':[20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200,210,220,230,240,250,260,270,280,290,300,310,320,330,340,350,360]} \
 --load-model-weights finetune_stage3_adaptstage2 \
 --optimizer-option lr_mult (\"$regexmatch\",1000) --start-lr 1e-6 \
 --optimizer-option weight_decay 0.01
@@ -24,7 +25,7 @@ modelhybridftopts="--network-config networks/example_ParticleTransformer2024Plus
 modelftopts="--network-config networks/example_ParticleTransformer2024PlusTagger_unified2_hybrid_sculpt.py \
 -o finetune_kw {'freeze_main_params':False,'mode':'cls','target_inds':None,'num_ft_nodes':3,'fc_params':[(512,0.1),(512,0.1)],'fc_suff_kw':{'append_after':'fc.0','params':[(512,0.1),(512,0.1)]}} \
 -o label_cls_nodes ['label_xggg','label_top','label_qcd'] -o label_stored ['label_xggg','label_top','label_qcd'] \
--o sculpt_kw {'enable':True,'lambda':1.0,'tau':0.05,'pass_fracs':[0.70,0.50,0.30],'score_index':0,'mass_bins':[20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200,210,220,230,240,250,260,270,280,290,300,310,320,330,340,350,360]} \
+-o sculpt_kw {'enable':True,'lambda':1.0,'tau':0.05,'pass_fracs':[0.70,0.50,0.30],'score_index':0,'mass_source':'finetune_parts','reg_index':1,'mass_bins':[20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200,210,220,230,240,250,260,270,280,290,300,310,320,330,340,350,360]} \
 --load-model-weights finetune_stage3_adaptstage2 \
 --optimizer-option lr_mult (\"$regexmatch\",1000) --start-lr 1e-6 \
 --optimizer-option weight_decay 0.01

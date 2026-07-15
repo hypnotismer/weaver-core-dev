@@ -83,7 +83,6 @@ new_variables:
     label_top: ((fj_label >= 0) & (fj_label <= 16)) & (event_label < 2000)
     label_qcd: ((fj_label >= 309) & (fj_label < 314)) & (event_label < 2000)
     is_sculpt: (event_label >= 2000)
-    sculpt_mass: fj_sdmass
 
 preprocess:
     ### method: [manual, auto] - whether to use manually specified parameters for variable standardization
@@ -255,9 +254,12 @@ observers:
 
 
 
+# kinematics for finetune reg-mass sculpt (mass_corr from network preds_reg)
 monitor_variables:
     - is_sculpt
-    - sculpt_mass
+    - jet_pt
+    - jet_corr_pt
+    - fj_mass
 
 weights:
     ### [option 1] use precomputed weights stored in the input files

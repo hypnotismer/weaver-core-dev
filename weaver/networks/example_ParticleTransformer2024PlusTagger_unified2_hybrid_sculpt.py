@@ -28,7 +28,11 @@ DEFAULT_SCULPT_KW = {
     'pass_fracs': [0.70, 0.50, 0.30],  # bkg rej 30/50/70%
     'score_index': 0,  # label_xggg
     'mass_bins': list(range(20, 361, 10)),
+    'mass_source': 'finetune_parts',  # soft/hard sculpt on finetune parts reg mass
+    'reg_index': 1,  # preds_reg[:,1] == target_parts_mass_factor
 }
+
+_SCULPT_NO_REG_WARNED = False
 
 
 def _resolve_sculpt_kw(sculpt_kw):
@@ -37,6 +41,17 @@ def _resolve_sculpt_kw(sculpt_kw):
     cfg = dict(DEFAULT_SCULPT_KW)
     cfg.update(sculpt_kw)
     return cfg
+
+
+def finetune_reg_mass(mass_corr, jet_pt, jet_corr_pt, fj_mass):
+    """AK15 regression mass; matches plot_mass_sculpting_xggg.regression_mass."""
+    jet_pt = jet_pt.reshape(-1).to(dtype=mass_corr.dtype)
+    jet_corr_pt = jet_corr_pt.reshape(-1).to(dtype=mass_corr.dtype)
+    fj_mass = fj_mass.reshape(-1).to(dtype=mass_corr.dtype)
+    mass_corr = mass_corr.reshape(-1)
+    raw_factor = 1.0 - jet_pt / jet_corr_pt.clamp(min=1e-6)
+    ak15_mass = fj_mass * jet_corr_pt / jet_pt.clamp(min=1e-6)
+    return mass_corr * ak15_mass * (1.0 - raw_factor)
 
 
 def soft_sculpt_loss(logits, mass, is_sculpt, sculpt_kw):
@@ -127,11 +142,41 @@ def _tag_subset_hybrid_loss(loss_func, logits, preds_reg, label_cls, label_reg, 
 
 
 def _read_sculpt_from_Z(Z, dev):
+    """Return is_sculpt and kinematics needed for finetune reg mass."""
     if Z is None or 'is_sculpt' not in Z:
         return None, None
     is_sculpt = Z['is_sculpt'].to(dev).float().reshape(-1)
-    mass = Z['sculpt_mass'].to(dev).float().reshape(-1) if 'sculpt_mass' in Z else None
-    return is_sculpt, mass
+    need = ('jet_pt', 'jet_corr_pt', 'fj_mass')
+    if not all(k in Z for k in need):
+        return is_sculpt, None
+    kin = {
+        'jet_pt': Z['jet_pt'].to(dev).float().reshape(-1),
+        'jet_corr_pt': Z['jet_corr_pt'].to(dev).float().reshape(-1),
+        'fj_mass': Z['fj_mass'].to(dev).float().reshape(-1),
+    }
+    return is_sculpt, kin
+
+
+def _compute_sculpt_mass(preds_reg, kin, sculpt_kw, logits_for_zero=None):
+    """Build finetune parts reg mass, or None if reg head / kinematics unavailable."""
+    global _SCULPT_NO_REG_WARNED
+    if kin is None or sculpt_kw is None or not sculpt_kw.get('enable', False):
+        return None
+    reg_index = int(sculpt_kw.get('reg_index', 1))
+    if preds_reg is None or preds_reg.ndim < 2 or preds_reg.shape[1] <= reg_index:
+        if not _SCULPT_NO_REG_WARNED:
+            _logger.warning(
+                'sculpt mass_source=finetune_parts requires preds_reg[:, %d]; '
+                'soft/hard sculpt skipped (e.g. cls-only mode).', reg_index)
+            _SCULPT_NO_REG_WARNED = True
+        return None
+    return finetune_reg_mass(
+        preds_reg[:, reg_index],
+        kin['jet_pt'],
+        kin['jet_corr_pt'],
+        kin['fj_mass'],
+    )
+
 
 ParticleTransformerTagger_ncoll = import_module(os.path.join(os.path.dirname(__file__), 'ParticleTransformer2024Plus.py'), 'ParT').ParticleTransformerTagger_ncoll
 
@@ -653,7 +698,7 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
             n_cls = model.module.num_cls_nodes if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.num_cls_nodes
             num_examples = label_cls.shape[0]
 
-            is_sculpt, sculpt_mass = _read_sculpt_from_Z(Z, dev)
+            is_sculpt, sculpt_kin = _read_sculpt_from_Z(Z, dev)
             if is_sculpt is None:
                 tag_mask = torch.ones(num_examples, dtype=torch.bool, device=dev)
             else:
@@ -675,7 +720,8 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 preds_reg = model_output[:, n_cls:]
                 loss_tag, loss_monitor = _tag_subset_hybrid_loss(
                     loss_func, logits, preds_reg, label_cls, label_reg, tag_mask)
-                if is_sculpt is not None and sculpt_mass is not None and sculpt_kw and sculpt_kw.get('enable', False):
+                sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
+                if is_sculpt is not None and sculpt_mass is not None:
                     loss_sculpt = soft_sculpt_loss(logits, sculpt_mass, is_sculpt, sculpt_kw)
                     loss = loss_tag + float(sculpt_kw.get('lambda', 1.0)) * loss_sculpt
                 else:
@@ -836,7 +882,7 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                 label_cls = label_cls.to(dev)
                 n_cls = model.module.num_cls_nodes if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.num_cls_nodes
 
-                is_sculpt, sculpt_mass = _read_sculpt_from_Z(Z, dev)
+                is_sculpt, sculpt_kin = _read_sculpt_from_Z(Z, dev)
                 if is_sculpt is None:
                     tag_mask = torch.ones(num_examples, dtype=torch.bool, device=dev)
                 else:
@@ -869,13 +915,15 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                         scores_cls.append(torch.softmax(logits[tag_mask], dim=1).detach().cpu().numpy())
                         labels['truth_label'].append(y['truth_label'][tag_mask.cpu()].cpu().numpy())
 
-                if for_training and is_sculpt is not None and sculpt_mass is not None and sculpt_kw and sculpt_kw.get('enable', False):
-                    sculpt_mask = is_sculpt > 0.5
-                    if sculpt_mask.any():
-                        score_index = int(sculpt_kw.get('score_index', 0))
-                        s = torch.softmax(logits, dim=1)[:, score_index]
-                        sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
-                        sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                if for_training and is_sculpt is not None and sculpt_kw and sculpt_kw.get('enable', False):
+                    sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
+                    if sculpt_mass is not None:
+                        sculpt_mask = is_sculpt > 0.5
+                        if sculpt_mask.any():
+                            score_index = int(sculpt_kw.get('score_index', 0))
+                            s = torch.softmax(logits, dim=1)[:, score_index]
+                            sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
+                            sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
 
                 _, preds_cls = logits.max(1)
                 n_tag = int(tag_mask.sum().item())
@@ -933,7 +981,7 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
             sculpt_kw.get('mass_bins', list(range(20, 361, 10))),
         )
         for k, v in mae_dict.items():
-            _logger.info('SculptMAE/val_%s: %.5f (n_sculpt=%d)', k, v, len(s_all))
+            _logger.info('SculptMAE/val_%s (finetune_parts_regmass): %.5f (n_sculpt=%d)', k, v, len(s_all))
         if tb_helper:
             tb_helper.write_scalars([
                 (f'SculptMAE/val_{k} (epoch)', v, epoch) for k, v in mae_dict.items() if np.isfinite(v)
@@ -1047,7 +1095,7 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
             label_counter.update(label.cpu().numpy())
             label = label.to(dev)
 
-            is_sculpt, sculpt_mass = _read_sculpt_from_Z(Z, dev)
+            is_sculpt, sculpt_kin = _read_sculpt_from_Z(Z, dev)
             if is_sculpt is None:
                 tag_mask = torch.ones(num_examples, dtype=torch.bool, device=dev)
             else:
@@ -1061,7 +1109,9 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                     loss_cls = loss_func(logits[tag_mask], label[tag_mask])
                 else:
                     loss_cls = logits.sum() * 0.0
-                if is_sculpt is not None and sculpt_mass is not None and sculpt_kw and sculpt_kw.get('enable', False):
+                # cls-only heads have no preds_reg -> sculpt skipped
+                sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
+                if is_sculpt is not None and sculpt_mass is not None:
                     loss_sculpt = soft_sculpt_loss(logits, sculpt_mass, is_sculpt, sculpt_kw)
                     loss = loss_cls + float(sculpt_kw.get('lambda', 1.0)) * loss_sculpt
                 else:
@@ -1179,7 +1229,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                 label_counter.update(label.cpu().numpy())
                 label = label.to(dev)
 
-                is_sculpt, sculpt_mass = _read_sculpt_from_Z(Z, dev)
+                is_sculpt, sculpt_kin = _read_sculpt_from_Z(Z, dev)
                 if is_sculpt is None:
                     tag_mask = torch.ones(num_examples, dtype=torch.bool, device=dev)
                 else:
@@ -1196,13 +1246,15 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                     for k, v in Z.items():
                         observers[k].append(v.cpu().numpy())
 
-                if for_training and is_sculpt is not None and sculpt_mass is not None and sculpt_kw and sculpt_kw.get('enable', False):
-                    sculpt_mask = is_sculpt > 0.5
-                    if sculpt_mask.any():
-                        score_index = int(sculpt_kw.get('score_index', 0))
-                        s = torch.softmax(logits, dim=1)[:, score_index]
-                        sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
-                        sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                if for_training and is_sculpt is not None and sculpt_kw and sculpt_kw.get('enable', False):
+                    sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
+                    if sculpt_mass is not None:
+                        sculpt_mask = is_sculpt > 0.5
+                        if sculpt_mask.any():
+                            score_index = int(sculpt_kw.get('score_index', 0))
+                            s = torch.softmax(logits, dim=1)[:, score_index]
+                            sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
+                            sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
 
                 _, preds = logits.max(1)
                 n_tag = int(tag_mask.sum().item())
@@ -1249,7 +1301,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
             sculpt_kw.get('mass_bins', list(range(20, 361, 10))),
         )
         for k, v in mae_dict.items():
-            _logger.info('SculptMAE/val_%s: %.5f (n_sculpt=%d)', k, v, len(s_all))
+            _logger.info('SculptMAE/val_%s (finetune_parts_regmass): %.5f (n_sculpt=%d)', k, v, len(s_all))
         if tb_helper:
             tb_helper.write_scalars([
                 (f'SculptMAE/val_{k} (epoch)', v, epoch) for k, v in mae_dict.items() if np.isfinite(v)
