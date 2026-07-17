@@ -344,16 +344,31 @@ class LogCoshLoss(torch.nn.L1Loss):
 
 class HybridLoss(torch.nn.Module):
 
-    def __init__(self, reduction='mean', gamma=1., split_reg=False):
+    def __init__(self, reduction='mean', gamma=1., split_reg=False, reg_cls_inds=None):
         super().__init__()
+        # When reg_cls_inds is set, only those truth_label indices contribute to regression.
+        # Mean is taken over the selected events (not the full batch), so gamma scale is preserved.
         self.loss_cls_fn = torch.nn.CrossEntropyLoss()
         self.loss_reg_fn = LogCoshLoss(reduction=reduction, split_reg=split_reg)
+        self.loss_reg_none_fn = LogCoshLoss(reduction='none', split_reg=split_reg)
         self.gamma = gamma
+        self.reg_cls_inds = None if reg_cls_inds is None else [int(i) for i in reg_cls_inds]
 
     def forward(self, input_cls, input_reg, target_cls, target_reg):
 
         loss_cls = self.loss_cls_fn(input_cls, target_cls)
-        loss_reg = self.loss_reg_fn(input_reg, target_reg, target_cls=target_cls, n_cls=input_cls.shape[1])
+        n_cls = input_cls.shape[1]
+        if self.reg_cls_inds is None:
+            loss_reg = self.loss_reg_fn(input_reg, target_reg, target_cls=target_cls, n_cls=n_cls)
+        else:
+            loss_reg_evt = self.loss_reg_none_fn(input_reg, target_reg, target_cls=target_cls, n_cls=n_cls)
+            mask = torch.zeros(target_cls.shape[0], dtype=torch.bool, device=target_cls.device)
+            for i in self.reg_cls_inds:
+                mask = mask | (target_cls == i)
+            if mask.any():
+                loss_reg = loss_reg_evt[mask].mean(dim=0)
+            else:
+                loss_reg = loss_reg_evt.new_zeros(loss_reg_evt.shape[1])
         loss = loss_cls + self.gamma * loss_reg.sum()
         loss_dict = {'cls': loss_cls.item(), 'reg': loss_reg.sum().item()}
         loss_dict.update({f'reg_{i}': loss_reg[i].item() for i in range(loss_reg.shape[0])})
@@ -425,11 +440,12 @@ def get_loss(data_config, **kwargs):
         split_reg = reg_kw.get('split_reg', False)
         composed_split_reg = reg_kw.get('composed_split_reg', None)
         as_resid_of = reg_kw.get('as_resid_of', False)
+        reg_cls_inds = reg_kw.get('reg_cls_inds', None)
         if gamma == 0:
             return CrossEntropyLossHybridWrapper()
         else:
             if composed_split_reg is None:
-                return HybridLoss(gamma=gamma, split_reg=split_reg)
+                return HybridLoss(gamma=gamma, split_reg=split_reg, reg_cls_inds=reg_cls_inds)
             else:
                 return ComposedHybridLoss(gamma=gamma, composed_split_reg=composed_split_reg, as_resid_of=as_resid_of)
     else:
@@ -443,10 +459,11 @@ def get_loss(data_config, **kwargs):
             split_reg = reg_kw.get('split_reg', False)
             composed_split_reg = reg_kw.get('composed_split_reg', None)
             as_resid_of = reg_kw.get('as_resid_of', False)
+            reg_cls_inds = reg_kw.get('reg_cls_inds', None)
             if gamma == 0:
                 return CrossEntropyLossHybridWrapper()
             elif composed_split_reg is None:
-                return HybridLoss(gamma=gamma, split_reg=split_reg)
+                return HybridLoss(gamma=gamma, split_reg=split_reg, reg_cls_inds=reg_cls_inds)
             else:
                 return ComposedHybridLoss(gamma=gamma, composed_split_reg=composed_split_reg, as_resid_of=as_resid_of)
         elif mode == 'reg':

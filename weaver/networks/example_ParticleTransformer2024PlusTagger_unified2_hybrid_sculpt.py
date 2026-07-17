@@ -21,14 +21,20 @@ from utils.nn.tools import (
 from utils.import_tools import import_module
 
 # Default soft-sculpt configuration (overridable via -o sculpt_kw {...})
+# sculpt_on: 'an' | 'train_bkg' | 'both'
+VALID_SCULPT_ON = ('an', 'train_bkg', 'both')
 DEFAULT_SCULPT_KW = {
     'enable': True,
+    'sculpt_on': 'an',
     'lambda': 1.0,
+    'lambda_train': None,  # None -> same as lambda
     'tau': 0.05,
     'pass_fracs': [0.70, 0.50, 0.30],  # bkg rej 30/50/70%
     'score_index': 0,  # label_xggg
-    # Only flatten high-mass bins (severe sculpting region); WP/eff0 still use all sculpt events.
+    # AN: high-mass bins; train_bkg: full train selection mass range (yaml fj_sdmass 20-360)
     'mass_bins': list(range(180, 361, 10)),
+    'mass_bins_train': list(range(20, 361, 10)),
+    'train_bkg_cls_indices': [1, 2],  # top, qcd under label_cls_nodes
     'mass_source': 'finetune_parts',  # soft/hard sculpt on finetune parts reg mass
     'reg_index': 1,  # preds_reg[:,1] == target_parts_mass_factor
 }
@@ -41,6 +47,10 @@ def _resolve_sculpt_kw(sculpt_kw):
         return None
     cfg = dict(DEFAULT_SCULPT_KW)
     cfg.update(sculpt_kw)
+    sculpt_on = cfg.get('sculpt_on', 'an')
+    if sculpt_on not in VALID_SCULPT_ON:
+        raise ValueError(
+            f"sculpt_kw['sculpt_on'] must be one of {VALID_SCULPT_ON}, got {sculpt_on!r}")
     return cfg
 
 
@@ -55,12 +65,12 @@ def finetune_reg_mass(mass_corr, jet_pt, jet_corr_pt, fj_mass):
     return mass_corr * ak15_mass * (1.0 - raw_factor)
 
 
-def soft_sculpt_loss(logits, mass, is_sculpt, sculpt_kw):
-    """Differentiable AN mass-sculpting penalty (soft cut / soft efficiency flatness)."""
+def soft_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=None):
+    """Differentiable mass-sculpting penalty (soft cut / soft efficiency flatness)."""
     if sculpt_kw is None or not sculpt_kw.get('enable', False):
         return logits.new_zeros(())
 
-    mask = is_sculpt.reshape(-1).bool()
+    mask = event_mask.reshape(-1).bool()
     n_sculpt = int(mask.sum().item())
     if n_sculpt < 8:
         return logits.sum() * 0.0
@@ -68,7 +78,8 @@ def soft_sculpt_loss(logits, mass, is_sculpt, sculpt_kw):
     score_index = int(sculpt_kw.get('score_index', 0))
     tau = float(sculpt_kw.get('tau', 0.05))
     pass_fracs = sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30])
-    mass_bins = sculpt_kw.get('mass_bins', list(range(180, 361, 10)))
+    if mass_bins is None:
+        mass_bins = sculpt_kw.get('mass_bins', list(range(180, 361, 10)))
 
     s = torch.softmax(logits, dim=-1)[:, score_index]
     s_m = s[mask]
@@ -96,6 +107,67 @@ def soft_sculpt_loss(logits, mass, is_sculpt, sculpt_kw):
     if not losses:
         return s.sum() * 0.0
     return torch.stack(losses).mean()
+
+
+def _sculpt_lambdas(sculpt_kw):
+    lam = float(sculpt_kw.get('lambda', 1.0))
+    lam_train = sculpt_kw.get('lambda_train', None)
+    if lam_train is None:
+        lam_train = lam
+    else:
+        lam_train = float(lam_train)
+    return lam, lam_train
+
+
+def _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw):
+    """Mask for soft sculpt on training backgrounds (default: top|qcd), excluding AN sculpt events."""
+    indices = sculpt_kw.get('train_bkg_cls_indices', [1, 2])
+    label_cls = label_cls.reshape(-1)
+    tag_mask = tag_mask.reshape(-1).bool()
+    bkg = torch.zeros_like(tag_mask)
+    for idx in indices:
+        bkg = bkg | (label_cls == int(idx))
+    return tag_mask & bkg
+
+
+def _dual_sculpt_losses(logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw):
+    """Return (loss_an, loss_train) according to sculpt_on."""
+    zero = logits.new_zeros(())
+    if sculpt_kw is None or not sculpt_kw.get('enable', False) or sculpt_mass is None:
+        return zero, zero
+    sculpt_on = sculpt_kw.get('sculpt_on', 'an')
+    loss_an = zero
+    loss_train = zero
+    if sculpt_on in ('an', 'both') and is_sculpt is not None:
+        loss_an = soft_sculpt_loss(
+            logits, sculpt_mass, is_sculpt, sculpt_kw,
+            mass_bins=sculpt_kw.get('mass_bins'),
+        )
+    if sculpt_on in ('train_bkg', 'both'):
+        mask_train = _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw)
+        loss_train = soft_sculpt_loss(
+            logits, sculpt_mass, mask_train, sculpt_kw,
+            mass_bins=sculpt_kw.get('mass_bins_train'),
+        )
+    return loss_an, loss_train
+
+
+def _log_hard_sculpt_mae(scores_list, masses_list, sculpt_kw, mass_bins, log_prefix, epoch, tb_helper=None):
+    if not scores_list:
+        return
+    s_all = np.concatenate(scores_list)
+    m_all = np.concatenate(masses_list)
+    mae_dict = hard_sculpt_mae(
+        s_all, m_all,
+        sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
+        mass_bins,
+    )
+    for k, v in mae_dict.items():
+        _logger.info('%s/val_%s (finetune_parts_regmass): %.5f (n=%d)', log_prefix, k, v, len(s_all))
+    if tb_helper:
+        tb_helper.write_scalars([
+            (f'{log_prefix}/val_{k} (epoch)', v, epoch) for k, v in mae_dict.items() if np.isfinite(v)
+        ])
 
 
 def hard_sculpt_mae(scores, masses, pass_fracs, mass_bins):
@@ -679,6 +751,8 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
     total_loss_cls = 0
     total_loss_reg = 0
     total_loss_sculpt = 0
+    total_loss_sculpt_an = 0
+    total_loss_sculpt_train = 0
     total_loss_reg_i = defaultdict(float)
     total_loss_reg_split = 0
     total_loss_reg_unifd = 0
@@ -722,12 +796,11 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 loss_tag, loss_monitor = _tag_subset_hybrid_loss(
                     loss_func, logits, preds_reg, label_cls, label_reg, tag_mask)
                 sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
-                if is_sculpt is not None and sculpt_mass is not None:
-                    loss_sculpt = soft_sculpt_loss(logits, sculpt_mass, is_sculpt, sculpt_kw)
-                    loss = loss_tag + float(sculpt_kw.get('lambda', 1.0)) * loss_sculpt
-                else:
-                    loss_sculpt = logits.new_zeros(())
-                    loss = loss_tag
+                loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
+                    logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw)
+                lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
+                loss_sculpt = loss_sculpt_an + loss_sculpt_train
+                loss = loss_tag + lam * loss_sculpt_an + lam_train * loss_sculpt_train
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
@@ -741,7 +814,9 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
 
             _, preds_cls = logits.max(1)
             loss = loss.item()
-            loss_sculpt_val = float(loss_sculpt.item()) if torch.is_tensor(loss_sculpt) else float(loss_sculpt)
+            loss_sculpt_an_val = float(loss_sculpt_an.item()) if torch.is_tensor(loss_sculpt_an) else float(loss_sculpt_an)
+            loss_sculpt_train_val = float(loss_sculpt_train.item()) if torch.is_tensor(loss_sculpt_train) else float(loss_sculpt_train)
+            loss_sculpt_val = loss_sculpt_an_val + loss_sculpt_train_val
 
             num_batches += 1
             count += num_examples
@@ -756,6 +831,8 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
             total_loss_cls += loss_monitor['cls']
             total_loss_reg += loss_monitor.get('reg', 0.0)
             total_loss_sculpt += loss_sculpt_val
+            total_loss_sculpt_an += loss_sculpt_an_val
+            total_loss_sculpt_train += loss_sculpt_train_val
             if 'reg_split' in loss_monitor:
                 total_loss_reg_split += loss_monitor['reg_split']
                 total_loss_reg_unifd += loss_monitor['reg_unifd']
@@ -769,6 +846,8 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 'lr': '%.2e' % scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'],
                 'Loss': '%.5f' % loss_monitor['cls'],
                 'LossReg': '%.5f' % loss_monitor.get('reg', 0.0),
+                'LossSculptAN': '%.5f' % loss_sculpt_an_val,
+                'LossSculptTrain': '%.5f' % loss_sculpt_train_val,
                 'LossSculpt': '%.5f' % loss_sculpt_val,
                 'LossTot': '%.5f' % loss,
                 'Acc': '%.5f' % (correct / max(n_tag, 1)),
@@ -779,6 +858,8 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 tb_helper.write_scalars([
                     ("Loss/train", loss_monitor['cls'], tb_helper.batch_train_count + num_batches), # to compare cls loss to previous loss
                     ("LossReg/train", loss_monitor.get('reg', 0.0), tb_helper.batch_train_count + num_batches),
+                    ("LossSculptAN/train", loss_sculpt_an_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptTrain/train", loss_sculpt_train_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculpt/train", loss_sculpt_val, tb_helper.batch_train_count + num_batches),
                     ("Acc/train", correct / max(n_tag, 1), tb_helper.batch_train_count + num_batches),
                     ])
@@ -802,15 +883,20 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
 
     time_diff = time.time() - start_time
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
-    _logger.info('Train AvgLoss: %.5f, AvgLossReg: %.5f, AvgLossSculpt: %.5f, AvgLossTot: %.5f, AvgAcc: %.5f' %
-                 (total_loss_cls / num_batches, total_loss_reg / num_batches, total_loss_sculpt / num_batches,
-                  total_loss / num_batches, total_correct / max(count_tag, 1)))
+    _logger.info(
+        'Train AvgLoss: %.5f, AvgLossReg: %.5f, AvgLossSculptAN: %.5f, AvgLossSculptTrain: %.5f, '
+        'AvgLossSculpt: %.5f, AvgLossTot: %.5f, AvgAcc: %.5f' %
+        (total_loss_cls / num_batches, total_loss_reg / num_batches,
+         total_loss_sculpt_an / num_batches, total_loss_sculpt_train / num_batches,
+         total_loss_sculpt / num_batches, total_loss / num_batches, total_correct / max(count_tag, 1)))
     _logger.info('Train class distribution: \n    %s', str(sorted(label_counter.items())))
 
     if tb_helper:
         tb_helper.write_scalars([
             ("Loss/train (epoch)", total_loss_cls / num_batches, epoch), # to compare cls loss to previous loss
             ("LossReg/train (epoch)", total_loss_reg / num_batches, epoch),
+            ("LossSculptAN/train (epoch)", total_loss_sculpt_an / num_batches, epoch),
+            ("LossSculptTrain/train (epoch)", total_loss_sculpt_train / num_batches, epoch),
             ("LossSculpt/train (epoch)", total_loss_sculpt / num_batches, epoch),
             ("LossTot/train (epoch)", total_loss / num_batches, epoch),
             ("Acc/train (epoch)", total_correct / max(count_tag, 1), epoch),
@@ -866,6 +952,8 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
     observers = defaultdict(list)
     sculpt_scores = []
     sculpt_masses = []
+    sculpt_scores_train = []
+    sculpt_masses_train = []
     start_time = time.time()
     model_embed_output_array = []
     label_cls_array = []
@@ -916,15 +1004,22 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                         scores_cls.append(torch.softmax(logits[tag_mask], dim=1).detach().cpu().numpy())
                         labels['truth_label'].append(y['truth_label'][tag_mask.cpu()].cpu().numpy())
 
-                if for_training and is_sculpt is not None and sculpt_kw and sculpt_kw.get('enable', False):
+                if for_training and sculpt_kw and sculpt_kw.get('enable', False):
                     sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
                     if sculpt_mass is not None:
-                        sculpt_mask = is_sculpt > 0.5
-                        if sculpt_mask.any():
-                            score_index = int(sculpt_kw.get('score_index', 0))
-                            s = torch.softmax(logits, dim=1)[:, score_index]
-                            sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
-                            sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                        score_index = int(sculpt_kw.get('score_index', 0))
+                        s = torch.softmax(logits, dim=1)[:, score_index]
+                        sculpt_on = sculpt_kw.get('sculpt_on', 'an')
+                        if sculpt_on in ('an', 'both') and is_sculpt is not None:
+                            sculpt_mask = is_sculpt > 0.5
+                            if sculpt_mask.any():
+                                sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
+                                sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                        if sculpt_on in ('train_bkg', 'both'):
+                            train_mask = _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw)
+                            if train_mask.any():
+                                sculpt_scores_train.append(s[train_mask].detach().cpu().numpy())
+                                sculpt_masses_train.append(sculpt_mass[train_mask].detach().cpu().numpy())
 
                 _, preds_cls = logits.max(1)
                 n_tag = int(tag_mask.sum().item())
@@ -973,20 +1068,15 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
     _logger.info('Evaluation class distribution: \n    %s', str(sorted(label_counter.items())))
 
-    if for_training and sculpt_scores and sculpt_kw and sculpt_kw.get('enable', False):
-        s_all = np.concatenate(sculpt_scores)
-        m_all = np.concatenate(sculpt_masses)
-        mae_dict = hard_sculpt_mae(
-            s_all, m_all,
-            sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
+    if for_training and sculpt_kw and sculpt_kw.get('enable', False):
+        _log_hard_sculpt_mae(
+            sculpt_scores, sculpt_masses, sculpt_kw,
             sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
-        )
-        for k, v in mae_dict.items():
-            _logger.info('SculptMAE/val_%s (finetune_parts_regmass): %.5f (n_sculpt=%d)', k, v, len(s_all))
-        if tb_helper:
-            tb_helper.write_scalars([
-                (f'SculptMAE/val_{k} (epoch)', v, epoch) for k, v in mae_dict.items() if np.isfinite(v)
-            ])
+            'SculptMAE', epoch, tb_helper)
+        _log_hard_sculpt_mae(
+            sculpt_scores_train, sculpt_masses_train, sculpt_kw,
+            sculpt_kw.get('mass_bins_train', list(range(20, 361, 10))),
+            'SculptMAE_trainbkg', epoch, tb_helper)
 
     if tb_helper:
         tb_mode = 'eval' if for_training else 'test'
@@ -1078,6 +1168,8 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
     total_loss = 0
     total_loss_cls = 0
     total_loss_sculpt = 0
+    total_loss_sculpt_an = 0
+    total_loss_sculpt_train = 0
     num_batches = 0
     total_correct = 0
     count = 0
@@ -1112,12 +1204,11 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                     loss_cls = logits.sum() * 0.0
                 # cls-only heads have no preds_reg -> sculpt skipped
                 sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
-                if is_sculpt is not None and sculpt_mass is not None:
-                    loss_sculpt = soft_sculpt_loss(logits, sculpt_mass, is_sculpt, sculpt_kw)
-                    loss = loss_cls + float(sculpt_kw.get('lambda', 1.0)) * loss_sculpt
-                else:
-                    loss_sculpt = logits.new_zeros(())
-                    loss = loss_cls
+                loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
+                    logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw)
+                lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
+                loss_sculpt = loss_sculpt_an + loss_sculpt_train
+                loss = loss_cls + lam * loss_sculpt_an + lam_train * loss_sculpt_train
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
@@ -1132,7 +1223,9 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
             _, preds = logits.max(1)
             loss_val = loss.item()
             loss_cls_val = float(loss_cls.item()) if torch.is_tensor(loss_cls) else float(loss_cls)
-            loss_sculpt_val = float(loss_sculpt.item()) if torch.is_tensor(loss_sculpt) else float(loss_sculpt)
+            loss_sculpt_an_val = float(loss_sculpt_an.item()) if torch.is_tensor(loss_sculpt_an) else float(loss_sculpt_an)
+            loss_sculpt_train_val = float(loss_sculpt_train.item()) if torch.is_tensor(loss_sculpt_train) else float(loss_sculpt_train)
+            loss_sculpt_val = loss_sculpt_an_val + loss_sculpt_train_val
 
             num_batches += 1
             count += num_examples
@@ -1142,11 +1235,15 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
             total_loss += loss_val
             total_loss_cls += loss_cls_val
             total_loss_sculpt += loss_sculpt_val
+            total_loss_sculpt_an += loss_sculpt_an_val
+            total_loss_sculpt_train += loss_sculpt_train_val
             total_correct += correct
 
             tq.set_postfix({
                 'lr': '%.2e' % scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'],
                 'Loss': '%.5f' % loss_cls_val,
+                'LossSculptAN': '%.5f' % loss_sculpt_an_val,
+                'LossSculptTrain': '%.5f' % loss_sculpt_train_val,
                 'LossSculpt': '%.5f' % loss_sculpt_val,
                 'AvgLoss': '%.5f' % (total_loss / num_batches),
                 'Acc': '%.5f' % (correct / max(n_tag, 1)),
@@ -1156,6 +1253,8 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                 tb_helper.write_scalars([
                     ("lr/train", scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'], tb_helper.batch_train_count + num_batches),
                     ("Loss/train", loss_cls_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptAN/train", loss_sculpt_an_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptTrain/train", loss_sculpt_train_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculpt/train", loss_sculpt_val, tb_helper.batch_train_count + num_batches),
                     ("Acc/train", correct / max(n_tag, 1), tb_helper.batch_train_count + num_batches),
                     ])
@@ -1168,13 +1267,18 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
 
     time_diff = time.time() - start_time
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
-    _logger.info('Train AvgLoss: %.5f, AvgLossSculpt: %.5f, AvgAcc: %.5f' % (
-        total_loss_cls / num_batches, total_loss_sculpt / num_batches, total_correct / max(count_tag, 1)))
+    _logger.info(
+        'Train AvgLoss: %.5f, AvgLossSculptAN: %.5f, AvgLossSculptTrain: %.5f, AvgLossSculpt: %.5f, AvgAcc: %.5f' % (
+            total_loss_cls / num_batches, total_loss_sculpt_an / num_batches,
+            total_loss_sculpt_train / num_batches, total_loss_sculpt / num_batches,
+            total_correct / max(count_tag, 1)))
     _logger.info('Train class distribution: \n    %s', str(sorted(label_counter.items())))
 
     if tb_helper:
         tb_helper.write_scalars([
             ("Loss/train (epoch)", total_loss_cls / num_batches, epoch),
+            ("LossSculptAN/train (epoch)", total_loss_sculpt_an / num_batches, epoch),
+            ("LossSculptTrain/train (epoch)", total_loss_sculpt_train / num_batches, epoch),
             ("LossSculpt/train (epoch)", total_loss_sculpt / num_batches, epoch),
             ("Acc/train (epoch)", total_correct / max(count_tag, 1), epoch),
             ])
@@ -1212,6 +1316,8 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     observers = defaultdict(list)
     sculpt_scores = []
     sculpt_masses = []
+    sculpt_scores_train = []
+    sculpt_masses_train = []
     start_time = time.time()
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
@@ -1247,15 +1353,22 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                     for k, v in Z.items():
                         observers[k].append(v.cpu().numpy())
 
-                if for_training and is_sculpt is not None and sculpt_kw and sculpt_kw.get('enable', False):
+                if for_training and sculpt_kw and sculpt_kw.get('enable', False):
                     sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
                     if sculpt_mass is not None:
-                        sculpt_mask = is_sculpt > 0.5
-                        if sculpt_mask.any():
-                            score_index = int(sculpt_kw.get('score_index', 0))
-                            s = torch.softmax(logits, dim=1)[:, score_index]
-                            sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
-                            sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                        score_index = int(sculpt_kw.get('score_index', 0))
+                        s = torch.softmax(logits, dim=1)[:, score_index]
+                        sculpt_on = sculpt_kw.get('sculpt_on', 'an')
+                        if sculpt_on in ('an', 'both') and is_sculpt is not None:
+                            sculpt_mask = is_sculpt > 0.5
+                            if sculpt_mask.any():
+                                sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
+                                sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                        if sculpt_on in ('train_bkg', 'both'):
+                            train_mask = _train_bkg_sculpt_mask(label, tag_mask, sculpt_kw)
+                            if train_mask.any():
+                                sculpt_scores_train.append(s[train_mask].detach().cpu().numpy())
+                                sculpt_masses_train.append(sculpt_mass[train_mask].detach().cpu().numpy())
 
                 _, preds = logits.max(1)
                 n_tag = int(tag_mask.sum().item())
@@ -1293,20 +1406,15 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
     _logger.info('Evaluation class distribution: \n    %s', str(sorted(label_counter.items())))
 
-    if for_training and sculpt_scores and sculpt_kw and sculpt_kw.get('enable', False):
-        s_all = np.concatenate(sculpt_scores)
-        m_all = np.concatenate(sculpt_masses)
-        mae_dict = hard_sculpt_mae(
-            s_all, m_all,
-            sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
+    if for_training and sculpt_kw and sculpt_kw.get('enable', False):
+        _log_hard_sculpt_mae(
+            sculpt_scores, sculpt_masses, sculpt_kw,
             sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
-        )
-        for k, v in mae_dict.items():
-            _logger.info('SculptMAE/val_%s (finetune_parts_regmass): %.5f (n_sculpt=%d)', k, v, len(s_all))
-        if tb_helper:
-            tb_helper.write_scalars([
-                (f'SculptMAE/val_{k} (epoch)', v, epoch) for k, v in mae_dict.items() if np.isfinite(v)
-            ])
+            'SculptMAE', epoch, tb_helper)
+        _log_hard_sculpt_mae(
+            sculpt_scores_train, sculpt_masses_train, sculpt_kw,
+            sculpt_kw.get('mass_bins_train', list(range(20, 361, 10))),
+            'SculptMAE_trainbkg', epoch, tb_helper)
 
     if tb_helper:
         tb_mode = 'eval' if for_training else 'test'
