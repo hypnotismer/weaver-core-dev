@@ -296,6 +296,8 @@ monitor_variables:
 - jet_pt
 - jet_corr_pt
 - fj_mass
+- fj_pt
+- fj_sdmass
 weights:
   use_precomputed_weights: false
   reweight_method: flat

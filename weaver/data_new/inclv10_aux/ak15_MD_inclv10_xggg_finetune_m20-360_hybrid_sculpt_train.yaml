@@ -254,11 +254,14 @@ observers:
 
 
 # kinematics for finetune reg-mass soft sculpt (mass_corr from network preds_reg)
+# fj_pt / fj_sdmass: used by network to look up reweight_hists (no dataset.py change)
 monitor_variables:
     - is_sculpt
     - jet_pt
     - jet_corr_pt
     - fj_mass
+    - fj_pt
+    - fj_sdmass
 
 weights:
     ### [option 1] use precomputed weights stored in the input files

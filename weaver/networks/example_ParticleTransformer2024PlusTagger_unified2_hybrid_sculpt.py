@@ -23,6 +23,7 @@ from utils.import_tools import import_module
 # Default soft-sculpt configuration (overridable via -o sculpt_kw {...})
 # sculpt_on: 'an' | 'train_bkg' | 'both'
 VALID_SCULPT_ON = ('an', 'train_bkg', 'both')
+VALID_BIN_WEIGHTING = ('occupancy', 'uniform')
 DEFAULT_SCULPT_KW = {
     'enable': True,
     'sculpt_on': 'an',
@@ -31,8 +32,9 @@ DEFAULT_SCULPT_KW = {
     # Soft-sculpt constraint starts at epoch >= warmup_epochs (0-based weaver epoch).
     # e.g. warmup_epochs=10 -> epochs 0..9 train without sculpt; from epoch 10 onward apply it.
     'warmup_epochs': 0,
-    'tau': 0.05,
-    'pass_fracs': [0.70, 0.50, 0.30],  # bkg rej 30/50/70%
+    # Soft cut/no-cut PDF-ratio flatness (aligned with plot_mass_sculpting_xggg).
+    'tau': 0.02,
+    'pass_fracs': [0.70, 0.50, 0.30],  # keep fractions (= bkg rej 30/50/70%)
     'score_index': 0,  # label_xggg
     # AN: high-mass bins; train_bkg: full train selection mass range (yaml fj_sdmass 20-360)
     'mass_bins': list(range(180, 361, 10)),
@@ -40,6 +42,15 @@ DEFAULT_SCULPT_KW = {
     'train_bkg_cls_indices': [1, 2],  # top, qcd under label_cls_nodes
     'mass_source': 'finetune_parts',  # soft/hard sculpt on finetune parts reg mass
     'reg_index': 1,  # preds_reg[:,1] == target_parts_mass_factor
+    # Rolling buffer approximates global WP thresholds / bin stats (avoids per-batch noise).
+    'buffer_size': 65536,
+    'min_bin_count': 32,
+    'bin_weighting': 'occupancy',  # 'occupancy' | 'uniform' (occupancy uses Σ event weights)
+    # Per-event reweight: look up data_config.reweight_hists via Z[fj_pt,fj_sdmass]
+    # + class label (no dataset.py change). After accept/reject sampling, ones is
+    # often preferable — set use_event_weight: False in that case.
+    'use_event_weight': True,
+    'weight_branch': 'weight_',  # optional precomputed branch in Z, if present
 }
 
 _SCULPT_NO_REG_WARNED = False
@@ -54,6 +65,12 @@ def _resolve_sculpt_kw(sculpt_kw):
     if sculpt_on not in VALID_SCULPT_ON:
         raise ValueError(
             f"sculpt_kw['sculpt_on'] must be one of {VALID_SCULPT_ON}, got {sculpt_on!r}")
+    weighting = cfg.get('bin_weighting', 'occupancy')
+    if weighting not in VALID_BIN_WEIGHTING:
+        raise ValueError(
+            f"sculpt_kw['bin_weighting'] must be one of {VALID_BIN_WEIGHTING}, got {weighting!r}")
+    cfg['buffer_size'] = int(cfg.get('buffer_size', 65536) or 65536)
+    cfg['min_bin_count'] = int(cfg.get('min_bin_count', 32) or 32)
     return cfg
 
 
@@ -68,48 +85,279 @@ def finetune_reg_mass(mass_corr, jet_pt, jet_corr_pt, fj_mass):
     return mass_corr * ak15_mass * (1.0 - raw_factor)
 
 
-def soft_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=None):
-    """Differentiable mass-sculpting penalty (soft cut / soft efficiency flatness)."""
+class ScoreMassBuffer:
+    """Fixed-capacity rolling buffer of detached (score, mass, event_weight)."""
+
+    def __init__(self, capacity):
+        self.capacity = max(int(capacity), 1)
+        self.scores = np.empty(0, dtype=np.float32)
+        self.masses = np.empty(0, dtype=np.float32)
+        self.weights = np.empty(0, dtype=np.float32)
+
+    def clear(self):
+        self.scores = np.empty(0, dtype=np.float32)
+        self.masses = np.empty(0, dtype=np.float32)
+        self.weights = np.empty(0, dtype=np.float32)
+
+    @property
+    def n(self):
+        return int(self.scores.shape[0])
+
+    @staticmethod
+    def _to_numpy(x):
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            return x.detach().float().reshape(-1).cpu().numpy().astype(np.float32, copy=False)
+        return np.asarray(x, dtype=np.float32).reshape(-1)
+
+    def append(self, scores, masses, weights=None):
+        scores = self._to_numpy(scores)
+        masses = self._to_numpy(masses)
+        if scores is None or masses is None or scores.size == 0:
+            return
+        if weights is None:
+            weights = np.ones(scores.shape[0], dtype=np.float32)
+        else:
+            weights = self._to_numpy(weights)
+            if weights.shape[0] != scores.shape[0]:
+                raise ValueError('ScoreMassBuffer.append: weights length mismatch')
+        self.scores = np.concatenate([self.scores, scores])
+        self.masses = np.concatenate([self.masses, masses])
+        self.weights = np.concatenate([self.weights, weights])
+        if self.scores.shape[0] > self.capacity:
+            self.scores = self.scores[-self.capacity:]
+            self.masses = self.masses[-self.capacity:]
+            self.weights = self.weights[-self.capacity:]
+
+    def as_tensors(self, device, dtype):
+        if self.n == 0:
+            return None, None, None
+        s = torch.as_tensor(self.scores, device=device, dtype=dtype)
+        m = torch.as_tensor(self.masses, device=device, dtype=dtype)
+        w = torch.as_tensor(self.weights, device=device, dtype=dtype)
+        return s, m, w
+
+
+def _make_sculpt_buffers(sculpt_kw):
+    if sculpt_kw is None or not sculpt_kw.get('enable', False):
+        return None, None
+    cap = int(sculpt_kw.get('buffer_size', 65536))
+    return ScoreMassBuffer(cap), ScoreMassBuffer(cap)
+
+
+def _lookup_reweight_from_hists(Z, label_cls, n, data_config):
+    """Numpy reweight factors from data_config.reweight_hists (same logic as weaver _build_weights)."""
+    hists = getattr(data_config, 'reweight_hists', None)
+    branches = getattr(data_config, 'reweight_branches', None)
+    bins = getattr(data_config, 'reweight_bins', None)
+    classes = getattr(data_config, 'reweight_classes', None)
+    if not hists or not branches or not bins or not classes:
+        return None
+    if Z is None or branches[0] not in Z or branches[1] not in Z:
+        return None
+    x = np.asarray(Z[branches[0]].detach().cpu().numpy() if torch.is_tensor(Z[branches[0]])
+                   else Z[branches[0]], dtype=np.float64).reshape(-1)
+    yv = np.asarray(Z[branches[1]].detach().cpu().numpy() if torch.is_tensor(Z[branches[1]])
+                    else Z[branches[1]], dtype=np.float64).reshape(-1)
+    if x.shape[0] != n or yv.shape[0] != n:
+        return None
+    if torch.is_tensor(label_cls):
+        cls = label_cls.detach().cpu().numpy().reshape(-1)
+    else:
+        cls = np.asarray(label_cls).reshape(-1)
+    if cls.shape[0] != n:
+        return None
+
+    x_bins, y_bins = bins
+    discard = getattr(data_config, 'reweight_discard_under_overflow', True)
+    wgt = np.zeros(n, dtype=np.float32)
+    x_idx = np.clip(np.digitize(x, x_bins) - 1, 0, len(x_bins) - 2)
+    y_idx = np.clip(np.digitize(yv, y_bins) - 1, 0, len(y_bins) - 2)
+    in_range = np.ones(n, dtype=bool)
+    if discard:
+        in_range = (
+            (x >= min(x_bins)) & (x <= max(x_bins)) &
+            (yv >= min(y_bins)) & (yv <= max(y_bins))
+        )
+    for i, label in enumerate(classes):
+        hist = hists.get(label) if isinstance(hists, dict) else None
+        if hist is None:
+            continue
+        hist = np.asarray(hist, dtype=np.float32)
+        pos = (cls == i) & in_range
+        if not np.any(pos):
+            continue
+        wgt[pos] = hist[x_idx[pos], y_idx[pos]]
+    return wgt
+
+
+def _read_event_weights(Z, n, device, dtype, sculpt_kw, data_config=None, label_cls=None):
+    """Return per-event reweight factors (detached). Falls back to ones.
+
+    Priority:
+      1) Z[weight_branch] if present (e.g. predict/observers)
+      2) lookup data_config.reweight_hists with Z[fj_pt,fj_sdmass] + label_cls
+      3) ones
+    """
+    ones = torch.ones(n, device=device, dtype=dtype)
+    if sculpt_kw is None or not sculpt_kw.get('use_event_weight', True):
+        return ones
+    branch = sculpt_kw.get('weight_branch', 'weight_')
+    if Z is not None and branch in Z:
+        w = Z[branch].to(device=device, dtype=dtype).reshape(-1)
+        if w.numel() == n:
+            return w.clamp(min=0.0).detach()
+        _logger.warning(
+            'sculpt weight branch %s length %d != batch %d; trying hist lookup', branch, w.numel(), n)
+    if data_config is not None and label_cls is not None:
+        w_np = _lookup_reweight_from_hists(Z, label_cls, n, data_config)
+        if w_np is not None:
+            return torch.as_tensor(w_np, device=device, dtype=dtype).clamp(min=0.0)
+    return ones
+
+
+def _weighted_quantile(values, weights, q):
+    """Weighted quantile; values/weights 1-D, q in [0,1]. No grad through result."""
+    values = values.detach()
+    weights = weights.detach().clamp(min=0.0)
+    if values.numel() == 0:
+        return values.new_zeros(())
+    if values.numel() == 1:
+        return values[0]
+    v, order = torch.sort(values)
+    w = weights[order]
+    cdf = torch.cumsum(w, dim=0)
+    total = cdf[-1].clamp(min=1e-8)
+    cdf = cdf / total
+    # first index where cdf >= q
+    idx = torch.searchsorted(cdf, values.new_tensor(float(q)))
+    idx = int(idx.clamp(max=v.numel() - 1).item())
+    return v[idx]
+
+
+def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=None,
+                               buffer=None, event_weights=None):
+    """Soft cut/no-cut PDF-ratio flatness (plot-aligned), with optional rolling buffer.
+
+    Histograms use per-event reweight ``event_weights`` (Σw, not raw counts):
+      h_all_b = Σ_i w_i 1_bin,  h_pass_b = Σ_i w_i softpass_i 1_bin
+    History in ``buffer`` is detached; current-batch scores keep gradients.
+    """
     if sculpt_kw is None or not sculpt_kw.get('enable', False):
         return logits.new_zeros(())
 
     mask = event_mask.reshape(-1).bool()
-    n_sculpt = int(mask.sum().item())
-    if n_sculpt < 8:
+    n_cur = int(mask.sum().item())
+    if n_cur < 1 and (buffer is None or buffer.n < 8):
         return logits.sum() * 0.0
 
     score_index = int(sculpt_kw.get('score_index', 0))
-    tau = float(sculpt_kw.get('tau', 0.05))
+    tau = float(sculpt_kw.get('tau', 0.02))
     pass_fracs = sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30])
+    min_bin_count = float(sculpt_kw.get('min_bin_count', 32) or 32)
+    weighting = sculpt_kw.get('bin_weighting', 'occupancy')
     if mass_bins is None:
         mass_bins = sculpt_kw.get('mass_bins', list(range(180, 361, 10)))
 
     s = torch.softmax(logits, dim=-1)[:, score_index]
-    s_m = s[mask]
-    mass_m = mass.reshape(-1).to(device=s.device, dtype=s.dtype)[mask]
+    s_cur = s[mask]
+    m_cur = mass.reshape(-1).to(device=s.device, dtype=s.dtype)[mask]
+    if event_weights is None:
+        ew_cur = torch.ones_like(s_cur)
+    else:
+        ew_cur = event_weights.reshape(-1).to(device=s.device, dtype=s.dtype)[mask].clamp(min=0.0)
 
-    bin_edges = torch.as_tensor(mass_bins, device=s.device, dtype=mass_m.dtype)
+    s_hist = m_hist = ew_hist = None
+    if buffer is not None and buffer.n > 0:
+        s_hist, m_hist, ew_hist = buffer.as_tensors(s.device, s.dtype)
+
+    # Threshold from detached history+current (weighted quantile), no grad through t.
+    if s_hist is not None and s_cur.numel() > 0:
+        s_for_thr = torch.cat([s_hist, s_cur.detach()], dim=0)
+        ew_for_thr = torch.cat([ew_hist, ew_cur.detach()], dim=0)
+    elif s_hist is not None:
+        s_for_thr = s_hist
+        ew_for_thr = ew_hist
+    else:
+        if s_cur.numel() < 8:
+            return s.sum() * 0.0
+        s_for_thr = s_cur.detach()
+        ew_for_thr = ew_cur.detach()
+
+    if s_for_thr.numel() < 8:
+        if buffer is not None and s_cur.numel() > 0:
+            buffer.append(s_cur, m_cur, ew_cur)
+        return s.sum() * 0.0
+
+    bin_edges = torch.as_tensor(mass_bins, device=s.device, dtype=s.dtype)
+    n_bins = len(mass_bins) - 1
+
     losses = []
     for p in pass_fracs:
         p = float(p)
-        # keep top fraction p -> threshold at quantile(1-p)
-        t = torch.quantile(s_m.detach(), 1.0 - p)
-        w_pass = torch.sigmoid((s_m - t) / max(tau, 1e-6))
-        eff0 = w_pass.mean()
-        rb = []
-        for i in range(len(mass_bins) - 1):
-            in_bin = (mass_m >= bin_edges[i]) & (mass_m < bin_edges[i + 1])
-            n_bin = in_bin.float().sum()
-            if n_bin < 1:
-                continue
-            eff_b = (w_pass * in_bin.float()).sum() / n_bin
-            rb.append((eff_b / (eff0 + 1e-8) - 1.0) ** 2)
-        if rb:
-            losses.append(torch.stack(rb).mean())
+        t = _weighted_quantile(s_for_thr, ew_for_thr, 1.0 - p)
+
+        # Soft pass * event weight; history detached, current differentiable via softpass.
+        parts_sw = []  # sample_weight * soft_pass
+        parts_ew = []  # sample_weight
+        parts_idx = []
+        if s_hist is not None:
+            soft_h = torch.sigmoid((s_hist - t) / max(tau, 1e-6))
+            idx_hist = torch.bucketize(m_hist, bin_edges) - 1
+            valid_h = (idx_hist >= 0) & (idx_hist < n_bins)
+            parts_sw.append((ew_hist * soft_h)[valid_h])
+            parts_ew.append(ew_hist[valid_h])
+            parts_idx.append(idx_hist[valid_h])
+        if s_cur.numel() > 0:
+            soft_c = torch.sigmoid((s_cur - t) / max(tau, 1e-6))
+            idx_cur = torch.bucketize(m_cur, bin_edges) - 1
+            valid_c = (idx_cur >= 0) & (idx_cur < n_bins)
+            parts_sw.append((ew_cur * soft_c)[valid_c])
+            parts_ew.append(ew_cur[valid_c])
+            parts_idx.append(idx_cur[valid_c])
+        if not parts_sw:
+            continue
+        sw_all = torch.cat(parts_sw, dim=0)
+        ew_all = torch.cat(parts_ew, dim=0)
+        idx_v = torch.cat(parts_idx, dim=0)
+        if idx_v.numel() == 0:
+            continue
+
+        h_all = torch.zeros(n_bins, device=s.device, dtype=s.dtype)
+        h_pass = torch.zeros(n_bins, device=s.device, dtype=s.dtype)
+        h_all.scatter_add_(0, idx_v, ew_all)
+        h_pass.scatter_add_(0, idx_v, sw_all)
+
+        # min_bin_count interpreted as minimum total event-weight in the bin
+        keep = h_all >= min_bin_count
+        if not bool(keep.any()):
+            continue
+        h_all_k = h_all[keep]
+        h_pass_k = h_pass[keep]
+        pdf_all = h_all_k / h_all_k.sum().clamp(min=1e-8)
+        pdf_pass = h_pass_k / h_pass_k.sum().clamp(min=1e-8)
+        R = pdf_pass / pdf_all.clamp(min=1e-8)
+        sq = (R - 1.0) ** 2
+        if weighting == 'occupancy':
+            wt = h_all_k / h_all_k.sum()
+            losses.append((sq * wt).sum())
+        else:
+            losses.append(sq.mean())
+
+    if buffer is not None and s_cur.numel() > 0:
+        buffer.append(s_cur, m_cur, ew_cur)
 
     if not losses:
         return s.sum() * 0.0
     return torch.stack(losses).mean()
+
+
+# Backward-compatible name used by older call sites / docs.
+def soft_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=None, buffer=None, event_weights=None):
+    return soft_pdf_ratio_sculpt_loss(
+        logits, mass, event_mask, sculpt_kw, mass_bins=mass_bins, buffer=buffer,
+        event_weights=event_weights)
 
 
 def _sculpt_lambdas(sculpt_kw):
@@ -141,7 +389,8 @@ def _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw):
     return tag_mask & bkg
 
 
-def _dual_sculpt_losses(logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw):
+def _dual_sculpt_losses(logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw,
+                        buffer_an=None, buffer_train=None, event_weights=None):
     """Return (loss_an, loss_train) according to sculpt_on."""
     zero = logits.new_zeros(())
     if sculpt_kw is None or not sculpt_kw.get('enable', False) or sculpt_mass is None:
@@ -150,62 +399,148 @@ def _dual_sculpt_losses(logits, sculpt_mass, is_sculpt, label_cls, tag_mask, scu
     loss_an = zero
     loss_train = zero
     if sculpt_on in ('an', 'both') and is_sculpt is not None:
-        loss_an = soft_sculpt_loss(
+        loss_an = soft_pdf_ratio_sculpt_loss(
             logits, sculpt_mass, is_sculpt, sculpt_kw,
             mass_bins=sculpt_kw.get('mass_bins'),
+            buffer=buffer_an,
+            event_weights=event_weights,
         )
     if sculpt_on in ('train_bkg', 'both'):
         mask_train = _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw)
-        loss_train = soft_sculpt_loss(
+        loss_train = soft_pdf_ratio_sculpt_loss(
             logits, sculpt_mass, mask_train, sculpt_kw,
             mass_bins=sculpt_kw.get('mass_bins_train'),
+            buffer=buffer_train,
+            event_weights=event_weights,
         )
     return loss_an, loss_train
 
 
-def _log_hard_sculpt_mae(scores_list, masses_list, sculpt_kw, mass_bins, log_prefix, epoch, tb_helper=None):
-    if not scores_list:
-        return
-    s_all = np.concatenate(scores_list)
-    m_all = np.concatenate(masses_list)
-    mae_dict = hard_sculpt_mae(
-        s_all, m_all,
-        sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
-        mass_bins,
-    )
-    for k, v in mae_dict.items():
-        _logger.info('%s/val_%s (finetune_parts_regmass): %.5f (n=%d)', log_prefix, k, v, len(s_all))
-    if tb_helper:
-        tb_helper.write_scalars([
-            (f'{log_prefix}/val_{k} (epoch)', v, epoch) for k, v in mae_dict.items() if np.isfinite(v)
-        ])
+def _np_weighted_quantile(values, weights, q):
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if values.size == 0:
+        return np.nan
+    order = np.argsort(values)
+    v = values[order]
+    w = np.clip(weights[order], 0.0, None)
+    cdf = np.cumsum(w)
+    total = cdf[-1]
+    if total <= 0:
+        return float(np.quantile(values, q))
+    cdf = cdf / total
+    return float(v[min(int(np.searchsorted(cdf, q)), len(v) - 1)])
 
 
-def hard_sculpt_mae(scores, masses, pass_fracs, mass_bins):
-    """Hard cut/no-cut MAE(|R-1|) for validation monitoring (numpy)."""
+def hard_sculpt_metrics(scores, masses, pass_fracs, mass_bins, min_bin_count=1, weights=None):
+    """Hard cut/no-cut PDF-ratio metrics matching plot_mass_sculpting_xggg.
+
+    When ``weights`` is given, histograms / quantiles use Σw (not raw counts).
+    Returns dict with per-WP mae_|R-1| and mse_(R-1)^2 plus means.
+    """
     scores = np.asarray(scores, dtype=np.float64)
     masses = np.asarray(masses, dtype=np.float64)
-    if scores.size < 8:
-        return {f'pass_{int(round(p * 100)):02d}': float('nan') for p in pass_fracs}
-
+    if weights is None:
+        weights = np.ones_like(scores, dtype=np.float64)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape[0] != scores.shape[0]:
+            weights = np.ones_like(scores, dtype=np.float64)
+        weights = np.clip(weights, 0.0, None)
     out = {}
+    maes, mses = [], []
     for p in pass_fracs:
         p = float(p)
-        t = np.quantile(scores, 1.0 - p)
+        key = f'pass_{int(round(p * 100)):02d}'
+        if scores.size < 8:
+            out[f'{key}_mae'] = float('nan')
+            out[f'{key}_mse'] = float('nan')
+            continue
+        t = _np_weighted_quantile(scores, weights, 1.0 - p)
         passed = scores >= t
-        h_all, _ = np.histogram(masses, bins=mass_bins)
-        h_pass, _ = np.histogram(masses[passed], bins=mass_bins)
-        valid = h_all > 0
+        h_all, _ = np.histogram(masses, bins=mass_bins, weights=weights)
+        h_pass, _ = np.histogram(masses[passed], bins=mass_bins, weights=weights[passed])
+        valid = h_all >= float(min_bin_count)
         if not np.any(valid) or h_pass.sum() <= 0:
-            out[f'pass_{int(round(p * 100)):02d}'] = float('nan')
+            out[f'{key}_mae'] = float('nan')
+            out[f'{key}_mse'] = float('nan')
             continue
         pdf_all = h_all.astype(np.float64) / max(h_all.sum(), 1e-10)
         pdf_pass = h_pass.astype(np.float64) / max(h_pass.sum(), 1e-10)
         with np.errstate(divide='ignore', invalid='ignore'):
             R = np.ones_like(pdf_all)
             R[valid] = pdf_pass[valid] / np.maximum(pdf_all[valid], 1e-10)
-        out[f'pass_{int(round(p * 100)):02d}'] = float(np.mean(np.abs(R[valid] - 1.0)))
+        mae = float(np.mean(np.abs(R[valid] - 1.0)))
+        mse = float(np.mean((R[valid] - 1.0) ** 2))
+        out[f'{key}_mae'] = mae
+        out[f'{key}_mse'] = mse
+        maes.append(mae)
+        mses.append(mse)
+    out['mae_mean'] = float(np.mean(maes)) if maes else float('nan')
+    out['mse_mean'] = float(np.mean(mses)) if mses else float('nan')
     return out
+
+
+def hard_sculpt_mae(scores, masses, pass_fracs, mass_bins, weights=None):
+    """Hard cut/no-cut MAE(|R-1|) for validation monitoring (numpy)."""
+    metrics = hard_sculpt_metrics(
+        scores, masses, pass_fracs, mass_bins, min_bin_count=1, weights=weights)
+    out = {}
+    for p in pass_fracs:
+        key = f'pass_{int(round(float(p) * 100)):02d}'
+        out[key] = metrics.get(f'{key}_mae', float('nan'))
+    return out
+
+
+def _log_hard_sculpt_metrics(scores, masses, sculpt_kw, mass_bins, log_prefix, epoch,
+                             tb_helper=None, weights=None):
+    if scores is None or masses is None:
+        return
+    scores = np.asarray(scores)
+    masses = np.asarray(masses)
+    if scores.size < 8:
+        return
+    min_bin = float(sculpt_kw.get('min_bin_count', 32) or 1)
+    metrics = hard_sculpt_metrics(
+        scores, masses,
+        sculpt_kw.get('pass_fracs', [0.70, 0.50, 0.30]),
+        mass_bins,
+        min_bin_count=min_bin,
+        weights=weights,
+    )
+    _logger.info(
+        '%s/hard mae_mean=%.5f mse_mean=%.5f (n=%d, sumw=%.1f, min_bin_w=%.3g, finetune_parts_regmass)',
+        log_prefix, metrics['mae_mean'], metrics['mse_mean'], scores.size,
+        float(np.sum(weights)) if weights is not None else float(scores.size), min_bin)
+    for k, v in metrics.items():
+        if k in ('mae_mean', 'mse_mean'):
+            continue
+        if np.isfinite(v):
+            _logger.info('%s/%s: %.5f', log_prefix, k, v)
+    if tb_helper:
+        tb_helper.write_scalars([
+            (f'{log_prefix}/{k} (epoch)', v, epoch)
+            for k, v in metrics.items() if np.isfinite(v)
+        ])
+
+
+def _log_hard_sculpt_mae(scores_list, masses_list, sculpt_kw, mass_bins, log_prefix, epoch,
+                         tb_helper=None, weights_list=None):
+    if not scores_list:
+        return
+    s_all = np.concatenate(scores_list)
+    m_all = np.concatenate(masses_list)
+    w_all = np.concatenate(weights_list) if weights_list else None
+    _log_hard_sculpt_metrics(
+        s_all, m_all, sculpt_kw, mass_bins, log_prefix, epoch, tb_helper, weights=w_all)
+
+
+def _log_buffer_hard_sculpt(buffer, sculpt_kw, mass_bins, log_prefix, epoch, tb_helper=None):
+    if buffer is None or buffer.n < 8:
+        return
+    _log_hard_sculpt_metrics(
+        buffer.scores, buffer.masses, sculpt_kw, mass_bins, log_prefix, epoch, tb_helper,
+        weights=buffer.weights)
 
 
 def _tag_subset_hybrid_loss(loss_func, logits, preds_reg, label_cls, label_reg, tag_mask):
@@ -757,11 +1092,17 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
     data_config = train_loader.dataset.config
     sculpt_kw = _resolve_sculpt_kw(sculpt_kw)
     sculpt_active = _sculpt_constraint_active(sculpt_kw, epoch)
+    buffer_an, buffer_train = _make_sculpt_buffers(sculpt_kw)
     if sculpt_kw and sculpt_kw.get('enable', False):
         warmup = int(sculpt_kw.get('warmup_epochs', 0) or 0)
         if sculpt_active:
             _logger.info(
-                'Soft-sculpt constraint ON (epoch=%d >= warmup_epochs=%d)', epoch, warmup)
+                'Soft-sculpt constraint ON (epoch=%d >= warmup_epochs=%d); '
+                'pdf-ratio loss buffer_size=%d min_bin_count=%d tau=%.3g',
+                epoch, warmup,
+                int(sculpt_kw.get('buffer_size', 65536)),
+                int(sculpt_kw.get('min_bin_count', 32)),
+                float(sculpt_kw.get('tau', 0.02)))
         else:
             _logger.info(
                 'Soft-sculpt warm-up: constraint OFF (epoch=%d < warmup_epochs=%d); '
@@ -816,10 +1157,14 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 preds_reg = model_output[:, n_cls:]
                 loss_tag, loss_monitor = _tag_subset_hybrid_loss(
                     loss_func, logits, preds_reg, label_cls, label_reg, tag_mask)
+                event_w = _read_event_weights(
+                    Z, num_examples, logits.device, logits.dtype, sculpt_kw,
+                    data_config=data_config, label_cls=label_cls)
                 if sculpt_active:
                     sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
                     loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
-                        logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw)
+                        logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw,
+                        buffer_an=buffer_an, buffer_train=buffer_train, event_weights=event_w)
                     lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
                     loss_sculpt = loss_sculpt_an + loss_sculpt_train
                     loss = loss_tag + lam * loss_sculpt_an + lam_train * loss_sculpt_train
@@ -828,7 +1173,8 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                     with torch.no_grad():
                         sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
                         loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
-                            logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw)
+                            logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw,
+                            buffer_an=buffer_an, buffer_train=buffer_train, event_weights=event_w)
                         loss_sculpt = loss_sculpt_an + loss_sculpt_train
                     loss = loss_tag
             if grad_scaler is None:
@@ -876,9 +1222,9 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 'lr': '%.2e' % scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'],
                 'Loss': '%.5f' % loss_monitor['cls'],
                 'LossReg': '%.5f' % loss_monitor.get('reg', 0.0),
-                'LossSculptAN': '%.5f' % loss_sculpt_an_val,
-                'LossSculptTrain': '%.5f' % loss_sculpt_train_val,
-                'LossSculpt': '%.5f' % loss_sculpt_val,
+                'LossSculptSoftAN': '%.5f' % loss_sculpt_an_val,
+                'LossSculptSoftTrain': '%.5f' % loss_sculpt_train_val,
+                'LossSculptSoft': '%.5f' % loss_sculpt_val,
                 'LossTot': '%.5f' % loss,
                 'Acc': '%.5f' % (correct / max(n_tag, 1)),
             })
@@ -888,6 +1234,10 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 tb_helper.write_scalars([
                     ("Loss/train", loss_monitor['cls'], tb_helper.batch_train_count + num_batches), # to compare cls loss to previous loss
                     ("LossReg/train", loss_monitor.get('reg', 0.0), tb_helper.batch_train_count + num_batches),
+                    ("LossSculptSoftAN/train", loss_sculpt_an_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptSoftTrain/train", loss_sculpt_train_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptSoft/train", loss_sculpt_val, tb_helper.batch_train_count + num_batches),
+                    # keep old names for TB continuity
                     ("LossSculptAN/train", loss_sculpt_an_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculptTrain/train", loss_sculpt_train_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculpt/train", loss_sculpt_val, tb_helper.batch_train_count + num_batches),
@@ -914,17 +1264,27 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
     time_diff = time.time() - start_time
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
     _logger.info(
-        'Train AvgLoss: %.5f, AvgLossReg: %.5f, AvgLossSculptAN: %.5f, AvgLossSculptTrain: %.5f, '
-        'AvgLossSculpt: %.5f, AvgLossTot: %.5f, AvgAcc: %.5f' %
+        'Train AvgLoss: %.5f, AvgLossReg: %.5f, AvgLossSculptSoftAN: %.5f, AvgLossSculptSoftTrain: %.5f, '
+        'AvgLossSculptSoft: %.5f, AvgLossTot: %.5f, AvgAcc: %.5f' %
         (total_loss_cls / num_batches, total_loss_reg / num_batches,
          total_loss_sculpt_an / num_batches, total_loss_sculpt_train / num_batches,
          total_loss_sculpt / num_batches, total_loss / num_batches, total_correct / max(count_tag, 1)))
     _logger.info('Train class distribution: \n    %s', str(sorted(label_counter.items())))
+    if sculpt_kw and sculpt_kw.get('enable', False):
+        _log_buffer_hard_sculpt(
+            buffer_an, sculpt_kw, sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
+            'SculptHard_train_AN', epoch, tb_helper)
+        _log_buffer_hard_sculpt(
+            buffer_train, sculpt_kw, sculpt_kw.get('mass_bins_train', list(range(20, 361, 10))),
+            'SculptHard_train_trainbkg', epoch, tb_helper)
 
     if tb_helper:
         tb_helper.write_scalars([
             ("Loss/train (epoch)", total_loss_cls / num_batches, epoch), # to compare cls loss to previous loss
             ("LossReg/train (epoch)", total_loss_reg / num_batches, epoch),
+            ("LossSculptSoftAN/train (epoch)", total_loss_sculpt_an / num_batches, epoch),
+            ("LossSculptSoftTrain/train (epoch)", total_loss_sculpt_train / num_batches, epoch),
+            ("LossSculptSoft/train (epoch)", total_loss_sculpt / num_batches, epoch),
             ("LossSculptAN/train (epoch)", total_loss_sculpt_an / num_batches, epoch),
             ("LossSculptTrain/train (epoch)", total_loss_sculpt_train / num_batches, epoch),
             ("LossSculpt/train (epoch)", total_loss_sculpt / num_batches, epoch),
@@ -982,8 +1342,10 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
     observers = defaultdict(list)
     sculpt_scores = []
     sculpt_masses = []
+    sculpt_weights = []
     sculpt_scores_train = []
     sculpt_masses_train = []
+    sculpt_weights_train = []
     start_time = time.time()
     model_embed_output_array = []
     label_cls_array = []
@@ -1039,17 +1401,22 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                     if sculpt_mass is not None:
                         score_index = int(sculpt_kw.get('score_index', 0))
                         s = torch.softmax(logits, dim=1)[:, score_index]
+                        event_w = _read_event_weights(
+                            Z, num_examples, logits.device, logits.dtype, sculpt_kw,
+                            data_config=data_config, label_cls=label_cls)
                         sculpt_on = sculpt_kw.get('sculpt_on', 'an')
                         if sculpt_on in ('an', 'both') and is_sculpt is not None:
                             sculpt_mask = is_sculpt > 0.5
                             if sculpt_mask.any():
                                 sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
                                 sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                                sculpt_weights.append(event_w[sculpt_mask].detach().cpu().numpy())
                         if sculpt_on in ('train_bkg', 'both'):
                             train_mask = _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw)
                             if train_mask.any():
                                 sculpt_scores_train.append(s[train_mask].detach().cpu().numpy())
                                 sculpt_masses_train.append(sculpt_mass[train_mask].detach().cpu().numpy())
+                                sculpt_weights_train.append(event_w[train_mask].detach().cpu().numpy())
 
                 _, preds_cls = logits.max(1)
                 n_tag = int(tag_mask.sum().item())
@@ -1102,11 +1469,11 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
         _log_hard_sculpt_mae(
             sculpt_scores, sculpt_masses, sculpt_kw,
             sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
-            'SculptMAE', epoch, tb_helper)
+            'SculptHard_val_AN', epoch, tb_helper, weights_list=sculpt_weights)
         _log_hard_sculpt_mae(
             sculpt_scores_train, sculpt_masses_train, sculpt_kw,
             sculpt_kw.get('mass_bins_train', list(range(20, 361, 10))),
-            'SculptMAE_trainbkg', epoch, tb_helper)
+            'SculptHard_val_trainbkg', epoch, tb_helper, weights_list=sculpt_weights_train)
 
     if tb_helper:
         tb_mode = 'eval' if for_training else 'test'
@@ -1194,11 +1561,17 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
     data_config = train_loader.dataset.config
     sculpt_kw = _resolve_sculpt_kw(sculpt_kw)
     sculpt_active = _sculpt_constraint_active(sculpt_kw, epoch)
+    buffer_an, buffer_train = _make_sculpt_buffers(sculpt_kw)
     if sculpt_kw and sculpt_kw.get('enable', False):
         warmup = int(sculpt_kw.get('warmup_epochs', 0) or 0)
         if sculpt_active:
             _logger.info(
-                'Soft-sculpt constraint ON (epoch=%d >= warmup_epochs=%d)', epoch, warmup)
+                'Soft-sculpt constraint ON (epoch=%d >= warmup_epochs=%d); '
+                'pdf-ratio loss buffer_size=%d min_bin_count=%d tau=%.3g',
+                epoch, warmup,
+                int(sculpt_kw.get('buffer_size', 65536)),
+                int(sculpt_kw.get('min_bin_count', 32)),
+                float(sculpt_kw.get('tau', 0.02)))
         else:
             _logger.info(
                 'Soft-sculpt warm-up: constraint OFF (epoch=%d < warmup_epochs=%d); '
@@ -1243,10 +1616,14 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                 else:
                     loss_cls = logits.sum() * 0.0
                 # cls-only heads have no preds_reg -> sculpt skipped unless reg available
+                event_w = _read_event_weights(
+                    Z, num_examples, logits.device, logits.dtype, sculpt_kw,
+                    data_config=data_config, label_cls=label)
                 if sculpt_active:
                     sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
                     loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
-                        logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw)
+                        logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw,
+                        buffer_an=buffer_an, buffer_train=buffer_train, event_weights=event_w)
                     lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
                     loss_sculpt = loss_sculpt_an + loss_sculpt_train
                     loss = loss_cls + lam * loss_sculpt_an + lam_train * loss_sculpt_train
@@ -1254,7 +1631,8 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                     with torch.no_grad():
                         sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
                         loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
-                            logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw)
+                            logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw,
+                            buffer_an=buffer_an, buffer_train=buffer_train, event_weights=event_w)
                         loss_sculpt = loss_sculpt_an + loss_sculpt_train
                     loss = loss_cls
             if grad_scaler is None:
@@ -1290,9 +1668,9 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
             tq.set_postfix({
                 'lr': '%.2e' % scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'],
                 'Loss': '%.5f' % loss_cls_val,
-                'LossSculptAN': '%.5f' % loss_sculpt_an_val,
-                'LossSculptTrain': '%.5f' % loss_sculpt_train_val,
-                'LossSculpt': '%.5f' % loss_sculpt_val,
+                'LossSculptSoftAN': '%.5f' % loss_sculpt_an_val,
+                'LossSculptSoftTrain': '%.5f' % loss_sculpt_train_val,
+                'LossSculptSoft': '%.5f' % loss_sculpt_val,
                 'AvgLoss': '%.5f' % (total_loss / num_batches),
                 'Acc': '%.5f' % (correct / max(n_tag, 1)),
                 'AvgAcc': '%.5f' % (total_correct / max(count_tag, 1))})
@@ -1301,6 +1679,9 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                 tb_helper.write_scalars([
                     ("lr/train", scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'], tb_helper.batch_train_count + num_batches),
                     ("Loss/train", loss_cls_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptSoftAN/train", loss_sculpt_an_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptSoftTrain/train", loss_sculpt_train_val, tb_helper.batch_train_count + num_batches),
+                    ("LossSculptSoft/train", loss_sculpt_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculptAN/train", loss_sculpt_an_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculptTrain/train", loss_sculpt_train_val, tb_helper.batch_train_count + num_batches),
                     ("LossSculpt/train", loss_sculpt_val, tb_helper.batch_train_count + num_batches),
@@ -1316,15 +1697,26 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
     time_diff = time.time() - start_time
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
     _logger.info(
-        'Train AvgLoss: %.5f, AvgLossSculptAN: %.5f, AvgLossSculptTrain: %.5f, AvgLossSculpt: %.5f, AvgAcc: %.5f' % (
+        'Train AvgLoss: %.5f, AvgLossSculptSoftAN: %.5f, AvgLossSculptSoftTrain: %.5f, '
+        'AvgLossSculptSoft: %.5f, AvgAcc: %.5f' % (
             total_loss_cls / num_batches, total_loss_sculpt_an / num_batches,
             total_loss_sculpt_train / num_batches, total_loss_sculpt / num_batches,
             total_correct / max(count_tag, 1)))
     _logger.info('Train class distribution: \n    %s', str(sorted(label_counter.items())))
+    if sculpt_kw and sculpt_kw.get('enable', False):
+        _log_buffer_hard_sculpt(
+            buffer_an, sculpt_kw, sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
+            'SculptHard_train_AN', epoch, tb_helper)
+        _log_buffer_hard_sculpt(
+            buffer_train, sculpt_kw, sculpt_kw.get('mass_bins_train', list(range(20, 361, 10))),
+            'SculptHard_train_trainbkg', epoch, tb_helper)
 
     if tb_helper:
         tb_helper.write_scalars([
             ("Loss/train (epoch)", total_loss_cls / num_batches, epoch),
+            ("LossSculptSoftAN/train (epoch)", total_loss_sculpt_an / num_batches, epoch),
+            ("LossSculptSoftTrain/train (epoch)", total_loss_sculpt_train / num_batches, epoch),
+            ("LossSculptSoft/train (epoch)", total_loss_sculpt / num_batches, epoch),
             ("LossSculptAN/train (epoch)", total_loss_sculpt_an / num_batches, epoch),
             ("LossSculptTrain/train (epoch)", total_loss_sculpt_train / num_batches, epoch),
             ("LossSculpt/train (epoch)", total_loss_sculpt / num_batches, epoch),
@@ -1364,8 +1756,10 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     observers = defaultdict(list)
     sculpt_scores = []
     sculpt_masses = []
+    sculpt_weights = []
     sculpt_scores_train = []
     sculpt_masses_train = []
+    sculpt_weights_train = []
     start_time = time.time()
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
@@ -1406,17 +1800,22 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                     if sculpt_mass is not None:
                         score_index = int(sculpt_kw.get('score_index', 0))
                         s = torch.softmax(logits, dim=1)[:, score_index]
+                        event_w = _read_event_weights(
+                            Z, num_examples, logits.device, logits.dtype, sculpt_kw,
+                            data_config=data_config, label_cls=label)
                         sculpt_on = sculpt_kw.get('sculpt_on', 'an')
                         if sculpt_on in ('an', 'both') and is_sculpt is not None:
                             sculpt_mask = is_sculpt > 0.5
                             if sculpt_mask.any():
                                 sculpt_scores.append(s[sculpt_mask].detach().cpu().numpy())
                                 sculpt_masses.append(sculpt_mass[sculpt_mask].detach().cpu().numpy())
+                                sculpt_weights.append(event_w[sculpt_mask].detach().cpu().numpy())
                         if sculpt_on in ('train_bkg', 'both'):
                             train_mask = _train_bkg_sculpt_mask(label, tag_mask, sculpt_kw)
                             if train_mask.any():
                                 sculpt_scores_train.append(s[train_mask].detach().cpu().numpy())
                                 sculpt_masses_train.append(sculpt_mass[train_mask].detach().cpu().numpy())
+                                sculpt_weights_train.append(event_w[train_mask].detach().cpu().numpy())
 
                 _, preds = logits.max(1)
                 n_tag = int(tag_mask.sum().item())
@@ -1458,11 +1857,11 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
         _log_hard_sculpt_mae(
             sculpt_scores, sculpt_masses, sculpt_kw,
             sculpt_kw.get('mass_bins', list(range(180, 361, 10))),
-            'SculptMAE', epoch, tb_helper)
+            'SculptHard_val_AN', epoch, tb_helper, weights_list=sculpt_weights)
         _log_hard_sculpt_mae(
             sculpt_scores_train, sculpt_masses_train, sculpt_kw,
             sculpt_kw.get('mass_bins_train', list(range(20, 361, 10))),
-            'SculptMAE_trainbkg', epoch, tb_helper)
+            'SculptHard_val_trainbkg', epoch, tb_helper, weights_list=sculpt_weights_train)
 
     if tb_helper:
         tb_mode = 'eval' if for_training else 'test'
