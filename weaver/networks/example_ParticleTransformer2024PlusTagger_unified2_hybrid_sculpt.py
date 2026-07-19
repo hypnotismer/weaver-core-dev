@@ -44,6 +44,8 @@ DEFAULT_SCULPT_KW = {
     'reg_index': 1,  # preds_reg[:,1] == target_parts_mass_factor
     # Rolling buffer approximates global WP thresholds / bin stats (avoids per-batch noise).
     'buffer_size': 65536,
+    # Minimum *event count* per mass bin (not Σw). PDF histograms still use Σw.
+    # Flat-reweight factors are often ~1e-2; gating on Σw>=32 would zero the loss.
     'min_bin_count': 32,
     'bin_weighting': 'occupancy',  # 'occupancy' | 'uniform' (occupancy uses Σ event weights)
     # Per-event reweight: look up data_config.reweight_hists via Z[fj_pt,fj_sdmass]
@@ -54,6 +56,7 @@ DEFAULT_SCULPT_KW = {
 }
 
 _SCULPT_NO_REG_WARNED = False
+_SCULPT_ZERO_LOSS_WARNED = False
 
 
 def _resolve_sculpt_kw(sculpt_kw):
@@ -242,8 +245,11 @@ def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=No
 
     Histograms use per-event reweight ``event_weights`` (Σw, not raw counts):
       h_all_b = Σ_i w_i 1_bin,  h_pass_b = Σ_i w_i softpass_i 1_bin
+    ``min_bin_count`` gates on *event count* per bin (ones), not Σw — otherwise
+    flat-reweight factors << 1 make every bin fail and the loss stays zero.
     History in ``buffer`` is detached; current-batch scores keep gradients.
     """
+    global _SCULPT_ZERO_LOSS_WARNED
     if sculpt_kw is None or not sculpt_kw.get('enable', False):
         return logits.new_zeros(())
 
@@ -290,6 +296,14 @@ def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=No
             buffer.append(s_cur, m_cur, ew_cur)
         return s.sum() * 0.0
 
+    # Avoid degenerate weighted quantile when all looked-up weights are ~0.
+    if float(ew_for_thr.sum().item()) <= 0:
+        ew_for_thr = torch.ones_like(ew_for_thr)
+        if s_cur.numel() > 0:
+            ew_cur = torch.ones_like(ew_cur)
+        if ew_hist is not None:
+            ew_hist = torch.ones_like(ew_hist)
+
     bin_edges = torch.as_tensor(mass_bins, device=s.device, dtype=s.dtype)
     n_bins = len(mass_bins) - 1
 
@@ -301,6 +315,7 @@ def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=No
         # Soft pass * event weight; history detached, current differentiable via softpass.
         parts_sw = []  # sample_weight * soft_pass
         parts_ew = []  # sample_weight
+        parts_ones = []  # event count
         parts_idx = []
         if s_hist is not None:
             soft_h = torch.sigmoid((s_hist - t) / max(tau, 1e-6))
@@ -308,6 +323,7 @@ def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=No
             valid_h = (idx_hist >= 0) & (idx_hist < n_bins)
             parts_sw.append((ew_hist * soft_h)[valid_h])
             parts_ew.append(ew_hist[valid_h])
+            parts_ones.append(torch.ones_like(ew_hist[valid_h]))
             parts_idx.append(idx_hist[valid_h])
         if s_cur.numel() > 0:
             soft_c = torch.sigmoid((s_cur - t) / max(tau, 1e-6))
@@ -315,26 +331,36 @@ def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=No
             valid_c = (idx_cur >= 0) & (idx_cur < n_bins)
             parts_sw.append((ew_cur * soft_c)[valid_c])
             parts_ew.append(ew_cur[valid_c])
+            parts_ones.append(torch.ones_like(ew_cur[valid_c]))
             parts_idx.append(idx_cur[valid_c])
         if not parts_sw:
             continue
         sw_all = torch.cat(parts_sw, dim=0)
         ew_all = torch.cat(parts_ew, dim=0)
+        ones_all = torch.cat(parts_ones, dim=0)
         idx_v = torch.cat(parts_idx, dim=0)
         if idx_v.numel() == 0:
             continue
 
         h_all = torch.zeros(n_bins, device=s.device, dtype=s.dtype)
         h_pass = torch.zeros(n_bins, device=s.device, dtype=s.dtype)
+        n_all = torch.zeros(n_bins, device=s.device, dtype=s.dtype)
         h_all.scatter_add_(0, idx_v, ew_all)
         h_pass.scatter_add_(0, idx_v, sw_all)
+        n_all.scatter_add_(0, idx_v, ones_all)
 
-        # min_bin_count interpreted as minimum total event-weight in the bin
-        keep = h_all >= min_bin_count
+        # Gate on event count; PDF still uses Σw
+        keep = n_all >= min_bin_count
         if not bool(keep.any()):
             continue
         h_all_k = h_all[keep]
         h_pass_k = h_pass[keep]
+        # Drop bins with vanishing Σw (would NaN the PDF)
+        w_ok = h_all_k > 0
+        if not bool(w_ok.any()):
+            continue
+        h_all_k = h_all_k[w_ok]
+        h_pass_k = h_pass_k[w_ok]
         pdf_all = h_all_k / h_all_k.sum().clamp(min=1e-8)
         pdf_pass = h_pass_k / h_pass_k.sum().clamp(min=1e-8)
         R = pdf_pass / pdf_all.clamp(min=1e-8)
@@ -349,6 +375,13 @@ def soft_pdf_ratio_sculpt_loss(logits, mass, event_mask, sculpt_kw, mass_bins=No
         buffer.append(s_cur, m_cur, ew_cur)
 
     if not losses:
+        if not _SCULPT_ZERO_LOSS_WARNED and (buffer is None or buffer.n >= max(int(min_bin_count), 8)):
+            mean_w = float(ew_for_thr.mean().item()) if ew_for_thr.numel() else float('nan')
+            _logger.warning(
+                'soft sculpt loss is zero (n_cur=%d, buffer=%d, mean_w=%.4g, min_bin_count=%g). '
+                'Check sculpt_mass/kin, train_bkg mask, or use_event_weight.',
+                n_cur, 0 if buffer is None else buffer.n, mean_w, min_bin_count)
+            _SCULPT_ZERO_LOSS_WARNED = True
         return s.sum() * 0.0
     return torch.stack(losses).mean()
 
@@ -460,7 +493,9 @@ def hard_sculpt_metrics(scores, masses, pass_fracs, mass_bins, min_bin_count=1, 
         passed = scores >= t
         h_all, _ = np.histogram(masses, bins=mass_bins, weights=weights)
         h_pass, _ = np.histogram(masses[passed], bins=mass_bins, weights=weights[passed])
-        valid = h_all >= float(min_bin_count)
+        n_all, _ = np.histogram(masses, bins=mass_bins)
+        # Gate on event count; PDF uses Σw
+        valid = (n_all >= float(min_bin_count)) & (h_all > 0)
         if not np.any(valid) or h_pass.sum() <= 0:
             out[f'{key}_mae'] = float('nan')
             out[f'{key}_mse'] = float('nan')
