@@ -28,6 +28,9 @@ DEFAULT_SCULPT_KW = {
     'sculpt_on': 'an',
     'lambda': 1.0,
     'lambda_train': None,  # None -> same as lambda
+    # Soft-sculpt constraint starts at epoch >= warmup_epochs (0-based weaver epoch).
+    # e.g. warmup_epochs=10 -> epochs 0..9 train without sculpt; from epoch 10 onward apply it.
+    'warmup_epochs': 0,
     'tau': 0.05,
     'pass_fracs': [0.70, 0.50, 0.30],  # bkg rej 30/50/70%
     'score_index': 0,  # label_xggg
@@ -117,6 +120,14 @@ def _sculpt_lambdas(sculpt_kw):
     else:
         lam_train = float(lam_train)
     return lam, lam_train
+
+
+def _sculpt_constraint_active(sculpt_kw, epoch):
+    """True when soft-sculpt should be added to the training loss this epoch."""
+    if sculpt_kw is None or not sculpt_kw.get('enable', False):
+        return False
+    warmup = int(sculpt_kw.get('warmup_epochs', 0) or 0)
+    return int(epoch) >= warmup
 
 
 def _train_bkg_sculpt_mask(label_cls, tag_mask, sculpt_kw):
@@ -745,6 +756,16 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
 
     data_config = train_loader.dataset.config
     sculpt_kw = _resolve_sculpt_kw(sculpt_kw)
+    sculpt_active = _sculpt_constraint_active(sculpt_kw, epoch)
+    if sculpt_kw and sculpt_kw.get('enable', False):
+        warmup = int(sculpt_kw.get('warmup_epochs', 0) or 0)
+        if sculpt_active:
+            _logger.info(
+                'Soft-sculpt constraint ON (epoch=%d >= warmup_epochs=%d)', epoch, warmup)
+        else:
+            _logger.info(
+                'Soft-sculpt warm-up: constraint OFF (epoch=%d < warmup_epochs=%d); '
+                'sculpt loss logged only', epoch, warmup)
 
     label_counter = Counter()
     total_loss = 0
@@ -795,12 +816,21 @@ def train_hybrid(model, loss_func, opt, scheduler, train_loader, dev, epoch, ste
                 preds_reg = model_output[:, n_cls:]
                 loss_tag, loss_monitor = _tag_subset_hybrid_loss(
                     loss_func, logits, preds_reg, label_cls, label_reg, tag_mask)
-                sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
-                loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
-                    logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw)
-                lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
-                loss_sculpt = loss_sculpt_an + loss_sculpt_train
-                loss = loss_tag + lam * loss_sculpt_an + lam_train * loss_sculpt_train
+                if sculpt_active:
+                    sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
+                    loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
+                        logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw)
+                    lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
+                    loss_sculpt = loss_sculpt_an + loss_sculpt_train
+                    loss = loss_tag + lam * loss_sculpt_an + lam_train * loss_sculpt_train
+                else:
+                    # warm-up: monitor sculpt only, do not backprop through it
+                    with torch.no_grad():
+                        sculpt_mass = _compute_sculpt_mass(preds_reg, sculpt_kin, sculpt_kw)
+                        loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
+                            logits, sculpt_mass, is_sculpt, label_cls, tag_mask, sculpt_kw)
+                        loss_sculpt = loss_sculpt_an + loss_sculpt_train
+                    loss = loss_tag
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
@@ -1163,6 +1193,16 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
     model.train()
     data_config = train_loader.dataset.config
     sculpt_kw = _resolve_sculpt_kw(sculpt_kw)
+    sculpt_active = _sculpt_constraint_active(sculpt_kw, epoch)
+    if sculpt_kw and sculpt_kw.get('enable', False):
+        warmup = int(sculpt_kw.get('warmup_epochs', 0) or 0)
+        if sculpt_active:
+            _logger.info(
+                'Soft-sculpt constraint ON (epoch=%d >= warmup_epochs=%d)', epoch, warmup)
+        else:
+            _logger.info(
+                'Soft-sculpt warm-up: constraint OFF (epoch=%d < warmup_epochs=%d); '
+                'sculpt loss logged only', epoch, warmup)
 
     label_counter = Counter()
     total_loss = 0
@@ -1202,13 +1242,21 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                     loss_cls = loss_func(logits[tag_mask], label[tag_mask])
                 else:
                     loss_cls = logits.sum() * 0.0
-                # cls-only heads have no preds_reg -> sculpt skipped
-                sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
-                loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
-                    logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw)
-                lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
-                loss_sculpt = loss_sculpt_an + loss_sculpt_train
-                loss = loss_cls + lam * loss_sculpt_an + lam_train * loss_sculpt_train
+                # cls-only heads have no preds_reg -> sculpt skipped unless reg available
+                if sculpt_active:
+                    sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
+                    loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
+                        logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw)
+                    lam, lam_train = _sculpt_lambdas(sculpt_kw) if sculpt_kw else (1.0, 1.0)
+                    loss_sculpt = loss_sculpt_an + loss_sculpt_train
+                    loss = loss_cls + lam * loss_sculpt_an + lam_train * loss_sculpt_train
+                else:
+                    with torch.no_grad():
+                        sculpt_mass = _compute_sculpt_mass(None, sculpt_kin, sculpt_kw)
+                        loss_sculpt_an, loss_sculpt_train = _dual_sculpt_losses(
+                            logits, sculpt_mass, is_sculpt, label, tag_mask, sculpt_kw)
+                        loss_sculpt = loss_sculpt_an + loss_sculpt_train
+                    loss = loss_cls
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
